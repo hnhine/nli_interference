@@ -1,0 +1,113 @@
+"""CSV and JSONL helpers for generated samples and model results."""
+
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+from typing import Any, Iterable
+
+PREFERRED_COLUMNS = [
+    "row_id",
+    "sample_id",
+    "base_event_id",
+    "experiment",
+    "condition",
+    "assumption",
+    "claim",
+    "prompt",
+    "expected_label",
+    "expected_R_sign",
+    "claim_subject",
+    "claim_verb_base",
+    "claim_verb_past",
+    "claim_object",
+    "claim_arg_type",
+    "claim_polarity",
+    "source_subject",
+    "source_verb_base",
+    "source_verb_past",
+    "source_object",
+    "source_arg_type",
+    "source_polarity",
+    "overlap_type",
+    "overlap_count",
+    "same_subject",
+    "same_verb",
+    "same_object",
+    "match_idx",
+    "match_polarity",
+    "pattern",
+    "order_pattern",
+    "claim_object_role",
+    "q",
+    "n_pos",
+    "n_neg",
+    "source_only",
+    "sanity_type",
+    "phase_relation",
+    "phase_cos",
+    "n_assumptions",
+    "source1_subject",
+    "source1_verb",
+    "source1_verb_base",
+    "source1_verb_past",
+    "source1_object",
+    "source1_arg_type",
+    "source1_polarity",
+    "source1_overlap_type",
+    "source2_subject",
+    "source2_verb",
+    "source2_verb_base",
+    "source2_verb_past",
+    "source2_object",
+    "source2_arg_type",
+    "source2_polarity",
+    "source2_overlap_type",
+    "source3_subject",
+    "source3_verb",
+    "source3_verb_base",
+    "source3_verb_past",
+    "source3_object",
+    "source3_arg_type",
+    "source3_polarity",
+    "source3_overlap_type",
+    "label_token_T",
+    "label_token_F",
+    "label_token_U",
+    "label_token_style",
+    "logit_T",
+    "logit_F",
+    "logit_U",
+    "R",
+    "U_gap",
+    "pred_label",
+    "is_correct",
+]
+
+
+def write_rows_csv(rows: list[dict[str, Any]], path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ordered_columns(rows)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return path
+
+
+def write_rows_jsonl(rows: Iterable[dict[str, Any]], path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+    return path
+
+
+def ordered_columns(rows: list[dict[str, Any]]) -> list[str]:
+    extras = sorted({key for row in rows for key in row} - set(PREFERRED_COLUMNS))
+    present_preferred = [column for column in PREFERRED_COLUMNS if any(column in row for row in rows)]
+    return present_preferred + extras
