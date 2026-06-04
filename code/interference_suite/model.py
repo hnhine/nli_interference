@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
@@ -73,10 +74,13 @@ class TFULogitScorer:
     def input_device(self):
         return next(self.model.parameters()).device
 
-    def score_prompts(self, prompts: Iterable[str], batch_size: int = 8) -> list[dict[str, Any]]:
+    def score_prompts(self, prompts: Iterable[str], batch_size: int = 8, show_progress: bool = True) -> list[dict[str, Any]]:
         prompts = list(prompts)
         results: list[dict[str, Any]] = []
-        for start in range(0, len(prompts), batch_size):
+        starts = range(0, len(prompts), batch_size)
+        if show_progress:
+            starts = progress_iter(starts, total=ceil(len(prompts) / batch_size), desc="Scoring prompts")
+        for start in starts:
             batch = prompts[start : start + batch_size]
             encoded = self.tokenizer(batch, padding=True, return_tensors="pt")
             encoded = {key: value.to(self.input_device) for key, value in encoded.items()}
@@ -101,6 +105,7 @@ def evaluate_rows(
     trust_remote_code: bool = False,
     cache_dir: str | None = DEFAULT_CACHE_DIR,
     local_files_only: bool = False,
+    show_progress: bool = True,
 ) -> list[dict[str, Any]]:
     scorer = TFULogitScorer(
         model_name=model_name,
@@ -112,7 +117,7 @@ def evaluate_rows(
         cache_dir=cache_dir,
         local_files_only=local_files_only,
     )
-    scored = scorer.score_prompts((row["prompt"] for row in rows), batch_size=batch_size)
+    scored = scorer.score_prompts((row["prompt"] for row in rows), batch_size=batch_size, show_progress=show_progress)
     for row, metrics in zip(rows, scored):
         row.update(metrics)
         row["is_correct"] = int(row["pred_label"] == row["expected_label"])
@@ -179,6 +184,14 @@ def resolve_torch_dtype(torch: Any, dtype: str | None) -> Any:
     if dtype not in mapping:
         raise ValueError(f"Unsupported torch dtype: {dtype}")
     return mapping[dtype]
+
+
+def progress_iter(iterable: Iterable[int], total: int, desc: str):
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, unit="batch")
 
 
 def normalize_cache_dir(cache_dir: str | None) -> str | None:

@@ -82,3 +82,34 @@ python code/run_interference_suite.py next-generate \
   --output-dir data/qwen3_8_next
 ```
 
+## Main Pipeline Includes Next Diagnostics
+
+The main `run` command now scores the original suite and the focused next-run diagnostics in one model load. For a large run such as 1000 base events:
+
+```bash
+python code/run_interference_suite.py run \
+  --model-name Qwen/Qwen3-8B \
+  --n-base-events 1000 \
+  --batch-size 8 \
+  --output-dir data/qwen3_8_1000 \
+  --local-files-only \
+  --plots
+```
+
+This produces about `63 * n_base_events` rows by default: original suite rows plus Exp4 v2, unrelated-conflict, Exp2b, and duplicate-control diagnostics. For 1000 base events, that is about 63,000 rows. The output summaries are split into:
+
+- `summary/summary_metrics.json` for the original suite.
+- `summary_next/next_run_summary_metrics.json` for the next diagnostics.
+
+To run only the original suite, add:
+
+```bash
+--no-next-diagnostics
+```
+
+To include only selected next diagnostics, use for example:
+
+```bash
+--next-sections exp4_v2 unrelated_conflict
+```
+

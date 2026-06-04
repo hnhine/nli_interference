@@ -51,20 +51,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.jsonl:
             write_rows_jsonl(rows, output_dir / args.jsonl_name)
         df = load_results(csv_path)
-        summary = write_summary_outputs(df, output_dir / "summary")
+        write_main_pipeline_summaries(df, output_dir)
         if args.plots:
-            plot_paths = plot_all(df, output_dir / "plots")
-            print(f"Wrote {len(plot_paths)} plots to {output_dir / 'plots'}")
+            original_df, _ = split_original_next(df)
+            plot_paths = plot_all(original_df, output_dir / "plots")
+            print(f"Wrote {len(plot_paths)} original-suite plots to {output_dir / 'plots'}")
         print(f"Wrote {len(rows)} scored samples to {csv_path}")
-        print(f"Wrote summary metrics to {output_dir / 'summary' / 'summary_metrics.json'}")
-        return 0 if summary else 1
+        print(f"Wrote original-suite summary to {output_dir / 'summary' / 'summary_metrics.json'}")
+        if has_next_diagnostic_rows(df):
+            print(f"Wrote next-diagnostics summary to {output_dir / 'summary_next' / 'next_run_summary_metrics.json'}")
+        return 0
 
     if args.command == "summarize":
         df = load_results(args.input_csv)
         output_dir = Path(args.output_dir)
-        write_summary_outputs(df, output_dir)
-        if args.plots:
-            plot_all(df, output_dir / "plots")
+        if has_next_diagnostic_rows(df):
+            write_main_pipeline_summaries(df, output_dir)
+            if args.plots:
+                original_df, _ = split_original_next(df)
+                plot_all(original_df, output_dir / "plots")
+        else:
+            write_summary_outputs(df, output_dir)
+            if args.plots:
+                plot_all(df, output_dir / "plots")
         print(f"Wrote summary outputs to {output_dir}")
         return 0
 
@@ -117,6 +126,27 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
+def has_next_diagnostic_rows(df) -> bool:
+    return "experiment" in df.columns and df["experiment"].astype(str).str.startswith("next_").any()
+
+
+def split_original_next(df):
+    if "run_family" in df.columns:
+        original = df[df["run_family"] != "next_diagnostics"].copy()
+        next_df = df[df["run_family"] == "next_diagnostics"].copy()
+    else:
+        original = df[~df["experiment"].astype(str).str.startswith("next_")].copy()
+        next_df = df[df["experiment"].astype(str).str.startswith("next_")].copy()
+    return original, next_df
+
+
+def write_main_pipeline_summaries(df, output_dir: Path) -> None:
+    original, next_df = split_original_next(df)
+    write_summary_outputs(original, output_dir / "summary")
+    if not next_df.empty:
+        write_next_run_summary(next_df, output_dir / "summary_next")
+
+
 def build_next_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
     sections = args.sections
     if sections == ["all"]:
@@ -133,13 +163,35 @@ def build_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
     experiments = args.experiments
     if experiments == ["all"]:
         experiments = list(EXPERIMENTS)
-    return generate_suite(
+    original_rows = generate_suite(
         n_base_events=args.n_base_events,
         seed=args.seed,
         experiments=experiments,
         include_exp3_sanity=args.include_exp3_sanity,
         include_exp4_source_only=not args.no_exp4_source_only,
     )
+    for row in original_rows:
+        row["run_family"] = "original_suite"
+
+    if getattr(args, "no_next_diagnostics", False):
+        rows = original_rows
+    else:
+        sections = getattr(args, "next_sections", ["all"])
+        if sections == ["all"]:
+            sections = list(NEXT_SECTIONS)
+        next_rows = generate_next_run(
+            n_base_events=args.n_base_events,
+            seed=args.seed,
+            base_events_from_csv="none",
+            sections=sections,
+        )
+        for row in next_rows:
+            row["run_family"] = "next_diagnostics"
+        rows = original_rows + next_rows
+
+    for idx, row in enumerate(rows):
+        row["row_id"] = idx
+    return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +269,8 @@ def add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--experiments", nargs="+", default=["all"], choices=["all", *EXPERIMENTS])
     parser.add_argument("--include-exp3-sanity", action="store_true")
     parser.add_argument("--no-exp4-source-only", action="store_true")
+    parser.add_argument("--no-next-diagnostics", action="store_true", help="Run only the original suite; by default the main pipeline also includes next-run diagnostics.")
+    parser.add_argument("--next-sections", nargs="+", default=["all"], choices=["all", *NEXT_SECTIONS], help="Which next-run diagnostics to include in the main generate/run pipeline.")
 
 
 if __name__ == "__main__":
