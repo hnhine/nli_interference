@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .generation import EXPERIMENTS, NEXT_SECTIONS, generate_next_run, generate_suite
+from .generation import EXPERIMENTS, generate_suite, generate_supplements, supplemental_sections_for_experiments
 from .io_utils import write_rows_csv, write_rows_jsonl
-from .metrics import has_next_diagnostic_rows, load_results, write_summary_outputs
+from .metrics import load_results, write_summary_outputs
 from .model import DEFAULT_CACHE_DIR, evaluate_rows
 from .plots import plot_all
 
@@ -51,9 +51,8 @@ def main(argv: list[str] | None = None) -> int:
         df = load_results(csv_path)
         write_main_pipeline_summaries(df, output_dir)
         if args.plots:
-            original_df, _ = split_original_next(df)
-            plot_paths = plot_all(original_df, output_dir / "plots")
-            print(f"Wrote {len(plot_paths)} original-suite plots to {output_dir / 'plots'}")
+            plot_paths = plot_all(df, output_dir / "plots")
+            print(f"Wrote {len(plot_paths)} plots to {output_dir / 'plots'}")
         print(f"Wrote {len(rows)} scored samples to {csv_path}")
         print(f"Wrote summary to {output_dir / 'summary' / 'summary_metrics.json'}")
         return 0
@@ -61,30 +60,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "summarize":
         df = load_results(args.input_csv)
         output_dir = Path(args.output_dir)
-        if has_next_diagnostic_rows(df):
-            write_main_pipeline_summaries(df, output_dir)
-            if args.plots:
-                original_df, _ = split_original_next(df)
-                plot_all(original_df, output_dir / "plots")
-        else:
-            write_summary_outputs(df, output_dir)
-            if args.plots:
-                plot_all(df, output_dir / "plots")
+        write_summary_outputs(df, output_dir)
+        if args.plots:
+            plot_all(df, output_dir / "plots")
         print(f"Wrote summary outputs to {output_dir}")
         return 0
 
     parser.print_help()
     return 1
-
-
-def split_original_next(df):
-    if "run_family" in df.columns:
-        original = df[df["run_family"] != "next_diagnostics"].copy()
-        next_df = df[df["run_family"] == "next_diagnostics"].copy()
-    else:
-        original = df[~df["experiment"].astype(str).str.startswith("next_")].copy()
-        next_df = df[df["experiment"].astype(str).str.startswith("next_")].copy()
-    return original, next_df
 
 
 def write_main_pipeline_summaries(df, output_dir: Path) -> None:
@@ -105,15 +88,16 @@ def build_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
     for row in original_rows:
         row["run_family"] = "original_suite"
 
-    next_rows = generate_next_run(
+    supplement_sections = supplemental_sections_for_experiments(experiments)
+    supplemental_rows = generate_supplements(
         n_base_events=args.n_base_events,
         seed=args.seed,
         base_events_from_csv="none",
-        sections=list(NEXT_SECTIONS),
+        sections=supplement_sections,
     )
-    for row in next_rows:
-        row["run_family"] = "next_diagnostics"
-    rows = original_rows + next_rows
+    for row in supplemental_rows:
+        row["run_family"] = "supplemental_suite"
+    rows = original_rows + supplemental_rows
 
     for idx, row in enumerate(rows):
         row["row_id"] = idx

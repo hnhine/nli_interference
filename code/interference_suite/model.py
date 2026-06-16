@@ -21,7 +21,7 @@ class LabelTokenConfig:
 
 
 class TFULogitScorer:
-    """Scores the next-token logits for labels T, F, and U."""
+    """Scores the label logits for T, F, and U."""
 
     def __init__(
         self,

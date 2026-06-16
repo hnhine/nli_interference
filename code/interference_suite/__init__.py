@@ -1,6 +1,6 @@
 """Modular experiment suite for the interference NLI probes."""
 
 from .base import Event, VerbSpec, z
-from .generation import NEXT_SECTIONS, generate_next_run, generate_suite
+from .generation import SUPPLEMENTAL_SECTIONS, generate_suite, generate_supplements
 
-__all__ = ["Event", "NEXT_SECTIONS", "VerbSpec", "generate_next_run", "generate_suite", "z"]
+__all__ = ["Event", "SUPPLEMENTAL_SECTIONS", "VerbSpec", "generate_suite", "generate_supplements", "z"]

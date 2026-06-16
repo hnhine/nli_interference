@@ -1,4 +1,4 @@
-"""Aggregate metrics for the interference experiments and diagnostics."""
+"""Aggregate metrics for the interference experiments and supplements."""
 
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ def write_summary_outputs(df: pd.DataFrame, output_dir: str | Path) -> dict[str,
     summary["exp3_clean_selection"] = summarize_exp3(df, output_dir)
     summary["exp4_cancellation"] = summarize_exp4(df, output_dir)
     summary["exp5_object_bound_phase"] = summarize_exp5(df, output_dir)
-    if has_next_diagnostic_rows(df):
-        summary["next_diagnostics"] = summarize_next_diagnostics(df, output_dir)
+    if has_supplemental_rows(df):
+        summary["supplements"] = summarize_supplements(df, output_dir)
     (output_dir / "summary_metrics.json").write_text(json.dumps(to_jsonable(summary), indent=2), encoding="utf-8")
     return summary
 
@@ -319,47 +319,41 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
-def has_next_diagnostic_rows(df: pd.DataFrame) -> bool:
-    return "experiment" in df.columns and df["experiment"].astype(str).str.startswith("next_").any()
+
+def has_supplemental_rows(df: pd.DataFrame) -> bool:
+    if "experiment" not in df.columns:
+        return False
+    supplemental = {
+        "exp2_counterbalanced_overlap",
+        "exp4_order_permutation",
+        "exp4_unrelated_conflict",
+        "exp4_duplicate_controls",
+    }
+    return df["experiment"].isin(supplemental).any()
 
 
-def summarize_next_diagnostics(df: pd.DataFrame, output_dir: str | Path) -> dict[str, Any]:
+def summarize_supplements(df: pd.DataFrame, output_dir: str | Path) -> dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "exp4_v2": summarize_exp4_v2(df, output_dir),
-        "unrelated_conflict": summarize_unrelated_conflict(df, output_dir),
-        "exp2b": summarize_exp2b(df, output_dir),
-        "duplicate_controls": summarize_duplicate_controls(df, output_dir),
+        "exp2_counterbalanced_overlap": summarize_exp2_counterbalanced(df, output_dir),
+        "exp4_order_permutation": summarize_exp4_order_permutation(df, output_dir),
+        "exp4_unrelated_conflict": summarize_exp4_unrelated_conflict(df, output_dir),
+        "exp4_duplicate_controls": summarize_exp4_duplicate_controls(df, output_dir),
     }
 
 
-def write_next_run_summary(df: pd.DataFrame, output_dir: str | Path) -> dict[str, Any]:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if not has_model_results(df):
-        summary = {"has_model_results": False, "message": "No logits found; generated next-run samples only."}
-        (output_dir / "next_run_summary_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        return summary
-
-    summary = {"has_model_results": True} | summarize_next_diagnostics(df, output_dir)
-    (output_dir / "next_run_summary_metrics.json").write_text(
-        json.dumps(to_jsonable(summary), indent=2), encoding="utf-8"
-    )
-    return summary
-
-
-def summarize_exp4_v2(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
-    exp = df[df["experiment"] == "next_exp4_v2_order_permutation"].copy()
+def summarize_exp4_order_permutation(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = df[df["experiment"] == "exp4_order_permutation"].copy()
     if exp.empty:
         return {}
 
     pattern_means = group_rates(exp, ["multiset", "pattern", "condition"])
-    pattern_means.to_csv(output_dir / "next_exp4_v2_pattern_means.csv", index=False)
+    pattern_means.to_csv(output_dir / "exp4_order_permutation_pattern_means.csv", index=False)
 
     balanced = exp[exp["pattern"].isin(["+-", "-+"])].copy()
     balanced_means = group_rates(balanced, ["pattern", "condition"])
-    balanced_means.to_csv(output_dir / "next_exp4_v2_balanced_diagnostic.csv", index=False)
+    balanced_means.to_csv(output_dir / "exp4_order_permutation_balanced_cases.csv", index=False)
 
     perm = exp[exp["multiset"].isin(["balanced", "positive_imbalance", "negative_imbalance"])]
     order_variance = (
@@ -367,7 +361,7 @@ def summarize_exp4_v2(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         .agg(order_std=("R", lambda s: float(np.std(s, ddof=0))), order_range=("R", lambda s: float(s.max() - s.min())), n=("R", "count"))
         .reset_index()
     )
-    order_variance.to_csv(output_dir / "next_exp4_v2_order_variance.csv", index=False)
+    order_variance.to_csv(output_dir / "exp4_order_permutation_order_variance.csv", index=False)
 
     regression = linear_regression(exp, "R", ["q", "last_sign", "mixed"])
     regression_with_neg = linear_regression(exp, "R", ["q", "last_sign", "mixed", "has_neg"])
@@ -387,25 +381,25 @@ def summarize_exp4_v2(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
     }
 
 
-def summarize_unrelated_conflict(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
-    exp = df[df["experiment"] == "next_unrelated_conflict"].copy()
+def summarize_exp4_unrelated_conflict(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = df[df["experiment"] == "exp4_unrelated_conflict"].copy()
     if exp.empty:
         return {}
 
     by_pattern = group_rates(exp, ["pattern", "condition"])
-    by_pattern.to_csv(output_dir / "next_unrelated_conflict_by_pattern.csv", index=False)
+    by_pattern.to_csv(output_dir / "exp4_unrelated_conflict_by_pattern.csv", index=False)
     pivot = exp.pivot_table(index="base_event_id", columns="pattern", values="R", aggfunc="mean")
     order_effect = nullable_float((pivot["+-"] - pivot["-+"]).mean()) if {"+-", "-+"}.issubset(pivot.columns) else None
     return summarize_rates(exp) | {"order_effect_mean_R_plus_minus_minus_plus": order_effect}
 
 
-def summarize_exp2b(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
-    exp = df[df["experiment"] == "next_exp2b_counterbalanced_overlap"].copy()
+def summarize_exp2_counterbalanced(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = df[df["experiment"] == "exp2_counterbalanced_overlap"].copy()
     if exp.empty:
         return {}
 
     condition_means = group_rates(exp, ["overlap_type", "phase_combo", "phase_relation"])
-    condition_means.to_csv(output_dir / "next_exp2b_condition_means.csv", index=False)
+    condition_means.to_csv(output_dir / "exp2_counterbalanced_condition_means.csv", index=False)
 
     rows = []
     for overlap_type, group in exp.groupby("overlap_type"):
@@ -426,7 +420,7 @@ def summarize_exp2b(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
             }
         )
     slopes = pd.DataFrame(rows)
-    slopes.to_csv(output_dir / "next_exp2b_phase_slopes.csv", index=False)
+    slopes.to_csv(output_dir / "exp2_counterbalanced_phase_slopes.csv", index=False)
 
     slope_map = dict(zip(slopes["overlap_type"], slopes["beta_phase_cos"]))
     svo = slope_map.get("SVO", np.nan)
@@ -444,15 +438,15 @@ def summarize_exp2b(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
     }
 
 
-def summarize_duplicate_controls(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
-    dup = df[df["experiment"] == "next_duplicate_controls"].copy()
-    exp4 = df[df["experiment"] == "next_exp4_v2_order_permutation"].copy()
+def summarize_exp4_duplicate_controls(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    dup = df[df["experiment"] == "exp4_duplicate_controls"].copy()
+    exp4 = df[df["experiment"] == "exp4_order_permutation"].copy()
     if dup.empty or exp4.empty:
         return {}
 
     controls = pd.concat([dup, exp4[exp4["source_only"] == 1]], ignore_index=True)
     by_pattern = group_rates(controls, ["pattern", "condition"])
-    by_pattern.to_csv(output_dir / "next_duplicate_controls_pattern_means.csv", index=False)
+    by_pattern.to_csv(output_dir / "exp4_duplicate_controls_pattern_means.csv", index=False)
 
     pivot = controls.pivot_table(index="base_event_id", columns="pattern", values="R", aggfunc="mean")
     needed = {"+", "-", "++", "--"}
@@ -460,7 +454,7 @@ def summarize_duplicate_controls(df: pd.DataFrame, output_dir: Path) -> dict[str
         out = pivot.reset_index()[["base_event_id", "+", "++", "-", "--"]].copy()
         out["delta_pp"] = out["++"] - out["+"]
         out["delta_mm"] = out["--"] - out["-"]
-        out.to_csv(output_dir / "next_duplicate_controls_deltas.csv", index=False)
+        out.to_csv(output_dir / "exp4_duplicate_controls_deltas.csv", index=False)
         return {
             "mean_R_plus": nullable_float(out["+"].mean()),
             "mean_R_pp": nullable_float(out["++"].mean()),

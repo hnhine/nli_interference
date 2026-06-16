@@ -28,6 +28,10 @@ def plot_all(df: pd.DataFrame, output_dir: str | Path) -> list[Path]:
     paths.extend(plot_exp3(df, output_dir, plt, sns))
     paths.extend(plot_exp4(df, output_dir, plt, sns))
     paths.extend(plot_exp5(df, output_dir, plt, sns))
+    paths.extend(plot_exp2_counterbalanced(df, output_dir, plt, sns))
+    paths.extend(plot_exp4_order_permutation(df, output_dir, plt, sns))
+    paths.extend(plot_exp4_unrelated_conflict(df, output_dir, plt, sns))
+    paths.extend(plot_exp4_duplicate_controls(df, output_dir, plt, sns))
     plt.close("all")
     return paths
 
@@ -157,3 +161,79 @@ def plot_exp5(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
         ax.bar_label(container, fmt="%.2f", padding=3, fontsize=9)
     sns.despine()
     return [save_current(output_dir / "exp5_object_bound_phase.png", plt)]
+
+
+
+def plot_exp2_counterbalanced(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    exp = df[df["experiment"] == "exp2_counterbalanced_overlap"].copy()
+    if exp.empty:
+        return []
+    paths = []
+    order = ["SVO", "SV", "VO", "S-only", "none"]
+    plt.figure(figsize=(9, 4.5))
+    sns.barplot(data=exp, x="overlap_type", y="R", hue="phase_relation", order=order, errorbar="se")
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 2 supplement: counterbalanced claim polarity")
+    plt.ylabel("R = logit(T) - logit(F)")
+    paths.append(save_current(output_dir / "exp2_counterbalanced_R_by_overlap_phase.png", plt))
+
+    slope_rows = []
+    for overlap_type, group in exp.groupby("overlap_type"):
+        same = group[group["phase_cos"] == 1]["R"].mean()
+        opposite = group[group["phase_cos"] == -1]["R"].mean()
+        slope_rows.append({"overlap_type": overlap_type, "beta_phase_cos": (same - opposite) / 2})
+    slopes = pd.DataFrame(slope_rows)
+    plt.figure(figsize=(8, 4))
+    sns.barplot(data=slopes, x="overlap_type", y="beta_phase_cos", order=order)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 2 supplement: phase slope by overlap")
+    plt.ylabel("Beta phase cos")
+    paths.append(save_current(output_dir / "exp2_counterbalanced_phase_slopes.png", plt))
+    return paths
+
+
+def plot_exp4_order_permutation(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    exp = df[df["experiment"] == "exp4_order_permutation"].copy()
+    if exp.empty:
+        return []
+    order = ["+--", "-+-", "--+", "+-", "-+", "++-", "+-+", "-++", "+", "-"]
+    exp["pattern"] = pd.Categorical(exp["pattern"], categories=order, ordered=True)
+    exp = exp.sort_values("pattern")
+    plt.figure(figsize=(10, 4.8))
+    sns.pointplot(data=exp, x="pattern", y="R", hue="multiset", order=order, errorbar="se", dodge=0.25)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 4 supplement: source-order permutations")
+    plt.ylabel("R = logit(T) - logit(F)")
+    return [save_current(output_dir / "exp4_order_permutation_R_by_pattern.png", plt)]
+
+
+def plot_exp4_unrelated_conflict(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    exp = df[df["experiment"] == "exp4_unrelated_conflict"].copy()
+    if exp.empty:
+        return []
+    order = ["+-", "-+"]
+    plt.figure(figsize=(5.5, 4))
+    sns.barplot(data=exp, x="pattern", y="R", order=order, errorbar="se")
+    sns.stripplot(data=exp, x="pattern", y="R", order=order, color="black", alpha=0.35, size=2)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 4 supplement: unrelated conflict")
+    plt.ylabel("R = logit(T) - logit(F)")
+    return [save_current(output_dir / "exp4_unrelated_conflict_R_by_pattern.png", plt)]
+
+
+def plot_exp4_duplicate_controls(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    dup = df[df["experiment"] == "exp4_duplicate_controls"].copy()
+    order_perm = df[df["experiment"] == "exp4_order_permutation"].copy()
+    controls = pd.concat([dup, order_perm[order_perm["source_only"] == 1]], ignore_index=True)
+    if controls.empty:
+        return []
+    order = ["+", "++", "-", "--"]
+    controls["pattern"] = pd.Categorical(controls["pattern"], categories=order, ordered=True)
+    controls = controls.sort_values("pattern")
+    plt.figure(figsize=(6.5, 4))
+    sns.barplot(data=controls, x="pattern", y="R", order=order, errorbar="se")
+    sns.stripplot(data=controls, x="pattern", y="R", order=order, color="black", alpha=0.35, size=2)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 4 supplement: duplicate controls")
+    plt.ylabel("R = logit(T) - logit(F)")
+    return [save_current(output_dir / "exp4_duplicate_controls_R_by_pattern.png", plt)]

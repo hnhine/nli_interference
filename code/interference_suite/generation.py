@@ -1,4 +1,4 @@
-"""Dataset generation for the interference experiments and diagnostics."""
+"""Dataset generation for the interference experiments and supplements."""
 
 from __future__ import annotations
 
@@ -30,12 +30,21 @@ EXPERIMENTS = (
     "exp4_cancellation",
     "exp5_object_bound_phase",
 )
-NEXT_SECTIONS = (
-    "exp4_v2",
-    "unrelated_conflict",
-    "exp2b",
-    "duplicate_controls",
+SUPPLEMENTAL_SECTIONS = (
+    "exp2_counterbalanced_overlap",
+    "exp4_order_permutation",
+    "exp4_unrelated_conflict",
+    "exp4_duplicate_controls",
 )
+
+SUPPLEMENTAL_SECTIONS_BY_EXPERIMENT = {
+    "exp2_carrier_overlap": ("exp2_counterbalanced_overlap",),
+    "exp4_cancellation": (
+        "exp4_order_permutation",
+        "exp4_unrelated_conflict",
+        "exp4_duplicate_controls",
+    ),
+}
 
 VERB_BY_BASE = {verb.base: verb for verb in VERBS}
 
@@ -568,34 +577,44 @@ def pattern_slug(polarities: Sequence[Polarity]) -> str:
     return "".join("p" if polarity == "positive" else "n" for polarity in polarities)
 
 
-def generate_next_run(
+
+
+def supplemental_sections_for_experiments(experiments: Sequence[str]) -> list[str]:
+    sections: list[str] = []
+    for experiment in experiments:
+        for section in SUPPLEMENTAL_SECTIONS_BY_EXPERIMENT.get(experiment, ()):
+            if section not in sections:
+                sections.append(section)
+    return sections
+
+def generate_supplements(
     n_base_events: int = 20,
     seed: int = 0,
     base_events_from_csv: str | None = "data/qwen3_8_pilot/samples.csv",
     sections: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Generate the focused diagnostics used by the main suite pipeline."""
+    """Generate the supplemental rows that travel with their parent experiments."""
 
-    selected = tuple(sections or NEXT_SECTIONS)
+    selected = tuple(SUPPLEMENTAL_SECTIONS if sections is None else sections)
     if selected == ("all",):
-        selected = NEXT_SECTIONS
-    unknown = sorted(set(selected) - set(NEXT_SECTIONS))
+        selected = SUPPLEMENTAL_SECTIONS
+    unknown = sorted(set(selected) - set(SUPPLEMENTAL_SECTIONS))
     if unknown:
-        raise ValueError(f"Unknown next-run sections: {unknown}")
+        raise ValueError(f"Unknown supplemental sections: {unknown}")
 
     rng = random.Random(seed)
     base_items = load_or_sample_base_events(n_base_events, seed, base_events_from_csv)
     rows: list[dict[str, Any]] = []
 
     for base_id, event in base_items:
-        if "exp4_v2" in selected:
-            rows.extend(generate_exp4_v2(base_id, event))
-        if "unrelated_conflict" in selected:
-            rows.extend(generate_unrelated_conflict(base_id, event, rng))
-        if "exp2b" in selected:
-            rows.extend(generate_exp2b(base_id, event, rng))
-        if "duplicate_controls" in selected:
-            rows.extend(generate_duplicate_controls(base_id, event))
+        if "exp2_counterbalanced_overlap" in selected:
+            rows.extend(generate_exp2_counterbalanced(base_id, event, rng))
+        if "exp4_order_permutation" in selected:
+            rows.extend(generate_exp4_order_permutation(base_id, event))
+        if "exp4_unrelated_conflict" in selected:
+            rows.extend(generate_exp4_unrelated_conflict(base_id, event, rng))
+        if "exp4_duplicate_controls" in selected:
+            rows.extend(generate_exp4_duplicate_controls(base_id, event))
 
     for idx, row in enumerate(rows):
         row["row_id"] = idx
@@ -641,7 +660,7 @@ def load_base_events_from_csv(path: str | Path, n_base_events: int | None = None
     return items
 
 
-def generate_exp4_v2(base_id: str, event: Event) -> list[dict[str, Any]]:
+def generate_exp4_order_permutation(base_id: str, event: Event) -> list[dict[str, Any]]:
     patterns = ["+-", "-+", "++-", "+-+", "-++", "+--", "-+-", "--+", "+", "-"]
     rows = []
     for pattern in patterns:
@@ -650,9 +669,9 @@ def generate_exp4_v2(base_id: str, event: Event) -> list[dict[str, Any]]:
         assumptions = [sentence(event, polarity) for polarity in polarities]
         rows.append(
             make_sample(
-                sample_id=f"next_exp4v2_{base_id}_{symbol_pattern_slug(pattern)}",
+                sample_id=f"exp4_order_{base_id}_{symbol_pattern_slug(pattern)}",
                 base_id=base_id,
-                experiment="next_exp4_v2_order_permutation",
+                experiment="exp4_order_permutation",
                 condition=exp4_condition(pattern),
                 assumptions=assumptions,
                 sources=[event for _ in polarities],
@@ -662,7 +681,7 @@ def generate_exp4_v2(base_id: str, event: Event) -> list[dict[str, Any]]:
                 expected_label=expected_label,
                 expected_R_sign=expected_sign,
                 extra=pattern_metadata(pattern) | {
-                    "next_run_section": "exp4_v2",
+                    "supplement_section": "exp4_order_permutation",
                     "multiset": multiset_name(pattern),
                 },
             )
@@ -670,7 +689,7 @@ def generate_exp4_v2(base_id: str, event: Event) -> list[dict[str, Any]]:
     return rows
 
 
-def generate_unrelated_conflict(base_id: str, conflict_event: Event, rng: random.Random) -> list[dict[str, Any]]:
+def generate_exp4_unrelated_conflict(base_id: str, conflict_event: Event, rng: random.Random) -> list[dict[str, Any]]:
     claim_event = clean_distractors(conflict_event, rng, count=1)[0]
     rows = []
     for pattern in ("+-", "-+"):
@@ -678,9 +697,9 @@ def generate_unrelated_conflict(base_id: str, conflict_event: Event, rng: random
         assumptions = [sentence(conflict_event, polarity) for polarity in polarities]
         rows.append(
             make_sample(
-                sample_id=f"next_unrelated_{base_id}_{symbol_pattern_slug(pattern)}",
+                sample_id=f"exp4_unrelated_{base_id}_{symbol_pattern_slug(pattern)}",
                 base_id=base_id,
-                experiment="next_unrelated_conflict",
+                experiment="exp4_unrelated_conflict",
                 condition=f"unrelated_conflict_{pattern}",
                 assumptions=assumptions,
                 sources=[conflict_event for _ in polarities],
@@ -690,7 +709,7 @@ def generate_unrelated_conflict(base_id: str, conflict_event: Event, rng: random
                 expected_label="U",
                 expected_R_sign=0,
                 extra=pattern_metadata(pattern) | {
-                    "next_run_section": "unrelated_conflict",
+                    "supplement_section": "exp4_unrelated_conflict",
                     "conflict_event_subject": conflict_event.subject,
                     "conflict_event_verb_base": conflict_event.verb.base,
                     "conflict_event_object": conflict_event.obj,
@@ -703,8 +722,8 @@ def generate_unrelated_conflict(base_id: str, conflict_event: Event, rng: random
     return rows
 
 
-def generate_exp2b(base_id: str, claim_event: Event, rng: random.Random) -> list[dict[str, Any]]:
-    source_by_overlap = exp2b_sources(claim_event, rng)
+def generate_exp2_counterbalanced(base_id: str, claim_event: Event, rng: random.Random) -> list[dict[str, Any]]:
+    source_by_overlap = exp2_counterbalanced_sources(claim_event, rng)
     phase_combos: list[tuple[Polarity, Polarity, str]] = [
         ("positive", "positive", "A+ C+"),
         ("negative", "positive", "A- C+"),
@@ -726,11 +745,11 @@ def generate_exp2b(base_id: str, claim_event: Event, rng: random.Random) -> list
             rows.append(
                 make_sample(
                     sample_id=(
-                        f"next_exp2b_{base_id}_{overlap_slug(overlap_type)}_"
+                        f"exp2_counterbalanced_{base_id}_{overlap_slug(overlap_type)}_"
                         f"{polarity_short(source_polarity)}_{polarity_short(claim_polarity)}"
                     ),
                     base_id=base_id,
-                    experiment="next_exp2b_counterbalanced_overlap",
+                    experiment="exp2_counterbalanced_overlap",
                     condition=f"{overlap_type}_{phase_combo.replace(' ', '')}",
                     assumptions=[sentence(source_event, source_polarity)],
                     sources=[source_event],
@@ -740,7 +759,7 @@ def generate_exp2b(base_id: str, claim_event: Event, rng: random.Random) -> list
                     expected_label=expected_label,
                     expected_R_sign=expected_sign,
                     extra={
-                        "next_run_section": "exp2b",
+                        "supplement_section": "exp2_counterbalanced_overlap",
                         "phase_combo": phase_combo,
                         "phase_relation": "same" if same_phase else "opposite",
                         "phase_cos": 1 if same_phase else -1,
@@ -750,16 +769,16 @@ def generate_exp2b(base_id: str, claim_event: Event, rng: random.Random) -> list
     return rows
 
 
-def generate_duplicate_controls(base_id: str, event: Event) -> list[dict[str, Any]]:
+def generate_exp4_duplicate_controls(base_id: str, event: Event) -> list[dict[str, Any]]:
     rows = []
     for pattern in ("++", "--"):
         polarities = polarities_from_pattern(pattern)
         expected_label, expected_sign = expected_from_q(pattern)
         rows.append(
             make_sample(
-                sample_id=f"next_duplicate_{base_id}_{symbol_pattern_slug(pattern)}",
+                sample_id=f"exp4_duplicate_{base_id}_{symbol_pattern_slug(pattern)}",
                 base_id=base_id,
-                experiment="next_duplicate_controls",
+                experiment="exp4_duplicate_controls",
                 condition="duplicate_positive" if pattern == "++" else "duplicate_negative",
                 assumptions=[sentence(event, polarity) for polarity in polarities],
                 sources=[event for _ in polarities],
@@ -769,7 +788,7 @@ def generate_duplicate_controls(base_id: str, event: Event) -> list[dict[str, An
                 expected_label=expected_label,
                 expected_R_sign=expected_sign,
                 extra=pattern_metadata(pattern) | {
-                    "next_run_section": "duplicate_controls",
+                    "supplement_section": "exp4_duplicate_controls",
                     "duplicate_control": 1,
                 },
             )
@@ -777,7 +796,7 @@ def generate_duplicate_controls(base_id: str, event: Event) -> list[dict[str, An
     return rows
 
 
-def exp2b_sources(claim_event: Event, rng: random.Random) -> dict[str, Event]:
+def exp2_counterbalanced_sources(claim_event: Event, rng: random.Random) -> dict[str, Event]:
     s_only_verb = choose_other_verb(claim_event.verb, rng, same_arg_type=True)
     none_verb = choose_other_verb(claim_event.verb, rng, same_arg_type=True)
     return {
