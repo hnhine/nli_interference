@@ -34,7 +34,7 @@ def plot_all(df: pd.DataFrame, output_dir: str | Path) -> list[Path]:
 
 def save_current(path: Path, plt) -> Path:
     plt.tight_layout()
-    plt.savefig(path, dpi=180)
+    plt.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
     return path
 
@@ -121,8 +121,39 @@ def plot_exp5(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
     if exp.empty:
         return []
     order = ["positive_object", "negative_object"]
-    plt.figure(figsize=(7, 4))
-    sns.pointplot(data=exp, x="claim_object_role", y="R", hue="order_pattern", order=order, errorbar="se")
-    plt.axhline(0, color="black", linewidth=1)
-    plt.title("Exp 5: object-bound phase")
+    hue_order = ["pos_then_neg", "neg_then_pos"]
+    role_labels = {
+        "positive_object": "Positive object\n(expected T)",
+        "negative_object": "Negative object\n(expected F)",
+    }
+    order_labels = {
+        "pos_then_neg": "Positive first",
+        "neg_then_pos": "Negative first",
+    }
+
+    display = exp.copy()
+    display["claim_object_role_label"] = display["claim_object_role"].map(role_labels)
+    display["order_pattern_label"] = display["order_pattern"].map(order_labels)
+
+    plt.figure(figsize=(10, 5.2))
+    ax = sns.barplot(
+        data=display,
+        x="claim_object_role_label",
+        y="R",
+        hue="order_pattern_label",
+        order=[role_labels[value] for value in order],
+        hue_order=[order_labels[value] for value in hue_order],
+        errorbar="se",
+        capsize=0.12,
+        palette=["#4C78A8", "#F58518"],
+    )
+    ax.axhline(0, color="black", linewidth=1.2)
+    ax.set_title("Exp 5: object-bound phase")
+    ax.set_xlabel("Query object")
+    ax.set_ylabel("R = logit(T) - logit(F)")
+    ax.set_ylim(min(-3.6, float(exp["R"].min()) - 0.45), max(1.9, float(exp["R"].max()) + 0.45))
+    ax.legend(title="Assumption order", loc="upper right", frameon=True)
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.2f", padding=3, fontsize=9)
+    sns.despine()
     return [save_current(output_dir / "exp5_object_bound_phase.png", plt)]
