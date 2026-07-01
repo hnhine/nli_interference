@@ -16,9 +16,22 @@ def has_model_results(df: pd.DataFrame) -> bool:
 
 def load_results(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    for column in ["logit_T", "logit_F", "logit_U", "R", "U_gap", "expected_R_sign"]:
+    numeric_columns = [
+        "logit_T",
+        "logit_F",
+        "logit_U",
+        "R",
+        "R_claim",
+        "R_axis",
+        "U_gap",
+        "expected_R_sign",
+        "claim_axis_sign",
+        "is_correct",
+    ]
+    for column in numeric_columns:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
+    ensure_axis_columns(df)
     return df
 
 
@@ -36,6 +49,7 @@ def write_summary_outputs(df: pd.DataFrame, output_dir: str | Path) -> dict[str,
     summary["exp3_clean_selection"] = summarize_exp3(df, output_dir)
     summary["exp4_cancellation"] = summarize_exp4(df, output_dir)
     summary["exp5_object_bound_phase"] = summarize_exp5(df, output_dir)
+    summary["exp6_negation_phase"] = summarize_exp6(df, output_dir)
     if has_supplemental_rows(df):
         summary["supplements"] = summarize_supplements(df, output_dir)
     (output_dir / "summary_metrics.json").write_text(json.dumps(to_jsonable(summary), indent=2), encoding="utf-8")
@@ -224,6 +238,337 @@ def summarize_exp5(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         "positive_object_flip_rate": nullable_float((compound_positive["R"] < 0).mean()),
         "label_acc": nullable_float(exp["is_correct"].mean()),
         "n": int(len(exp)),
+    }
+
+
+def summarize_exp6(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = df[df["experiment"] == "exp6_negation_phase"].copy()
+    if exp.empty:
+        return {}
+    ensure_axis_columns(exp)
+    return {
+        "exp6a_absolute_negation": summarize_exp6a(exp, output_dir),
+        "exp6b_frequency_negation": summarize_exp6b(exp, output_dir),
+    }
+
+
+def summarize_exp6a(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = exp6_subframe(df, "exp6a_absolute_negation")
+    if exp.empty:
+        return {}
+
+    by_form = exp6_by_form(exp, output_dir / "exp6a_by_form.csv")
+    wide_R = exp6_wide(exp, "R")
+    wide_axis = exp6_wide(exp, "R_axis")
+    deltas = exp6a_deltas(wide_R)
+    if not deltas.empty:
+        deltas.to_csv(output_dir / "exp6a_deltas.csv", index=False)
+
+    coeff_detail, coeff_summary = exp6_coefficients(
+        wide=wide_axis,
+        assumption_forms=["AFF", "DID_NOT", "DID_NOT_EVER", "NEVER"],
+        positive_claim="C_POS",
+        negative_claim="C_DID_NOT",
+        positive_anchor="AFF",
+        negative_anchor="DID_NOT",
+    )
+    if not coeff_detail.empty:
+        coeff_detail.to_csv(output_dir / "exp6a_coefficients_by_base.csv", index=False)
+    if not coeff_summary.empty:
+        coeff_summary.to_csv(output_dir / "exp6a_coefficients.csv", index=False)
+
+    anchor = exp6a_anchor_control(wide_R)
+    if not anchor.empty:
+        anchor.to_csv(output_dir / "exp6a_anchor_control.csv", index=False)
+
+    hard_rows = exp[exp.get("label_confidence", "hard") != "diagnostic"]
+    return {
+        "n": int(len(exp)),
+        "main_accuracy_excluding_diagnostic": nullable_float(hard_rows["is_correct"].mean() if not hard_rows.empty else np.nan),
+        "by_form_rows": int(len(by_form)),
+        "sign_consistency": {
+            "never_sign_acc": paired_sign_acc(wide_value(wide_R, "NEVER", "C_POS"), wide_value(wide_R, "NEVER", "C_DID_NOT")),
+            "did_not_ever_sign_acc": paired_sign_acc(wide_value(wide_R, "DID_NOT_EVER", "C_POS"), wide_value(wide_R, "DID_NOT_EVER", "C_DID_NOT")),
+        },
+        "delta_means": dataframe_means(deltas, exclude={"base_event_id"}),
+        "coefficient_means": coefficient_summary_dict(coeff_summary),
+        "anchor_contamination_means": dataframe_means(anchor, exclude={"base_event_id"}),
+        "interpretation_rules": exp6a_interpretation_rules(),
+    }
+
+
+def summarize_exp6b(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    exp = exp6_subframe(df, "exp6b_frequency_negation")
+    if exp.empty:
+        return {}
+
+    by_form = exp6_by_form(exp, output_dir / "exp6b_by_form.csv")
+    wide = exp6_wide(exp, "R_axis")
+    coeff_detail, coeff_summary = exp6_coefficients(
+        wide=wide,
+        assumption_forms=["OFTEN", "DID_NOT_OFTEN", "RARELY", "SELDOM", "HARDLY_EVER"],
+        positive_claim="C_OFTEN",
+        negative_claim="C_DID_NOT_OFTEN",
+        positive_anchor="OFTEN",
+        negative_anchor="DID_NOT_OFTEN",
+    )
+    if not coeff_detail.empty:
+        coeff_detail.to_csv(output_dir / "exp6b_coefficients_by_base.csv", index=False)
+    if not coeff_summary.empty:
+        coeff_summary.to_csv(output_dir / "exp6b_coefficients.csv", index=False)
+
+    u_by_assumption = (
+        exp.groupby("assumption_form", dropna=False)
+        .agg(
+            mean_U_gap=("U_gap", "mean"),
+            U_rate=("pred_label", lambda s: (s == "U").mean()),
+            n=("sample_id", "count"),
+        )
+        .reset_index()
+    )
+    u_by_assumption.to_csv(output_dir / "exp6b_u_by_assumption.csv", index=False)
+
+    directional_rows = exp[exp.get("label_confidence", "hard") != "diagnostic"]
+    return {
+        "n": int(len(exp)),
+        "accuracy_including_directional_labels": nullable_float(directional_rows["is_correct"].mean() if not directional_rows.empty else np.nan),
+        "by_form_rows": int(len(by_form)),
+        "coefficient_means": coefficient_summary_dict(coeff_summary),
+        "mean_U_gap_by_assumption": {
+            str(row["assumption_form"]): nullable_float(row["mean_U_gap"])
+            for _, row in u_by_assumption.iterrows()
+        },
+        "outcome_rules": {
+            "stable_graded_coefficient": "Approximate forms have kappa_hat < 0 with low E_reuse.",
+            "u_dominant": "High U_gap or U_rate means the model treats the claim as underdetermined.",
+            "reuse_failure": "High E_reuse means no reusable frequency-polarity coefficient.",
+        },
+    }
+
+
+def ensure_axis_columns(df: pd.DataFrame) -> None:
+    if "R_claim" not in df.columns and "R" in df.columns:
+        df["R_claim"] = df["R"]
+    if "R" not in df.columns and "R_claim" in df.columns:
+        df["R"] = df["R_claim"]
+    if "claim_axis_sign" not in df.columns:
+        df["claim_axis_sign"] = 1
+    df["claim_axis_sign"] = pd.to_numeric(df["claim_axis_sign"], errors="coerce").fillna(1)
+    if "R_claim" in df.columns:
+        df["R_claim"] = pd.to_numeric(df["R_claim"], errors="coerce")
+    if "R" in df.columns:
+        df["R"] = pd.to_numeric(df["R"], errors="coerce")
+    if "R_axis" not in df.columns:
+        df["R_axis"] = df["claim_axis_sign"] * df.get("R", np.nan)
+    else:
+        df["R_axis"] = pd.to_numeric(df["R_axis"], errors="coerce")
+        missing = df["R_axis"].isna() & df.get("R", pd.Series(np.nan, index=df.index)).notna()
+        df.loc[missing, "R_axis"] = df.loc[missing, "claim_axis_sign"] * df.loc[missing, "R"]
+
+
+def exp6_subframe(df: pd.DataFrame, subexperiment: str) -> pd.DataFrame:
+    if "subexperiment" not in df.columns:
+        return pd.DataFrame()
+    exp = df[(df["experiment"] == "exp6_negation_phase") & (df["subexperiment"] == subexperiment)].copy()
+    if exp.empty:
+        return exp
+    ensure_axis_columns(exp)
+    ensure_assumption_form(exp)
+    return exp
+
+
+def ensure_assumption_form(df: pd.DataFrame) -> None:
+    if "assumption_form" not in df.columns and "source_form" in df.columns:
+        df["assumption_form"] = df["source_form"]
+
+
+def exp6_by_form(exp: pd.DataFrame, path: Path) -> pd.DataFrame:
+    rows = []
+    for (assumption_form, claim_form), group in exp.groupby(["assumption_form", "claim_form"], dropna=False):
+        non_diagnostic = group[group.get("label_confidence", "hard") != "diagnostic"]
+        rows.append(
+            {
+                "assumption_form": assumption_form,
+                "claim_form": claim_form,
+                "label_confidence": ",".join(sorted(str(v) for v in group.get("label_confidence", pd.Series(dtype=str)).dropna().unique())),
+                "mean_R": group["R"].mean(),
+                "median_R": group["R"].median(),
+                "mean_R_axis": group["R_axis"].mean(),
+                "mean_U_gap": group["U_gap"].mean(),
+                "T_rate": (group["pred_label"] == "T").mean(),
+                "F_rate": (group["pred_label"] == "F").mean(),
+                "U_rate": (group["pred_label"] == "U").mean(),
+                "accuracy": group["is_correct"].mean(),
+                "main_accuracy": non_diagnostic["is_correct"].mean() if not non_diagnostic.empty else np.nan,
+                "n": len(group),
+            }
+        )
+    out = pd.DataFrame(rows)
+    out.to_csv(path, index=False)
+    return out
+
+
+def exp6_wide(exp: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    if exp.empty or value_col not in exp.columns:
+        return pd.DataFrame()
+    return exp.pivot_table(index="base_event_id", columns=["assumption_form", "claim_form"], values=value_col, aggfunc="mean")
+
+
+def wide_value(wide: pd.DataFrame, assumption_form: str, claim_form: str) -> pd.Series:
+    if wide.empty:
+        return pd.Series(dtype=float)
+    key = (assumption_form, claim_form)
+    if key in wide.columns:
+        return wide[key]
+    return pd.Series(np.nan, index=wide.index, dtype=float)
+
+
+def exp6a_deltas(wide: pd.DataFrame) -> pd.DataFrame:
+    if wide.empty:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {
+            "base_event_id": wide.index,
+            "delta_R_never_notever_C_POS": wide_value(wide, "NEVER", "C_POS") - wide_value(wide, "DID_NOT_EVER", "C_POS"),
+            "delta_R_never_notever_C_DID_NOT": wide_value(wide, "NEVER", "C_DID_NOT") - wide_value(wide, "DID_NOT_EVER", "C_DID_NOT"),
+            "delta_R_notever_not_C_POS": wide_value(wide, "DID_NOT_EVER", "C_POS") - wide_value(wide, "DID_NOT", "C_POS"),
+            "delta_R_notever_not_C_DID_NOT": wide_value(wide, "DID_NOT_EVER", "C_DID_NOT") - wide_value(wide, "DID_NOT", "C_DID_NOT"),
+        }
+    ).reset_index(drop=True)
+
+
+def exp6a_anchor_control(wide: pd.DataFrame) -> pd.DataFrame:
+    if wide.empty:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {
+            "base_event_id": wide.index,
+            "G_anchor_DIDNOT": wide_value(wide, "DID_NOT", "C_DID_NOT") - wide_value(wide, "DID_NOT", "C_NEVER"),
+            "G_anchor_NEVER": wide_value(wide, "NEVER", "C_NEVER") - wide_value(wide, "NEVER", "C_DID_NOT"),
+            "G_anchor_DID_NOT_EVER": wide_value(wide, "DID_NOT_EVER", "C_NEVER") - wide_value(wide, "DID_NOT_EVER", "C_DID_NOT"),
+        }
+    ).reset_index(drop=True)
+
+
+def exp6_coefficients(
+    wide: pd.DataFrame,
+    assumption_forms: list[str],
+    positive_claim: str,
+    negative_claim: str,
+    positive_anchor: str,
+    negative_anchor: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if wide.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    pos_anchor_pos_claim = wide_value(wide, positive_anchor, positive_claim)
+    neg_anchor_pos_claim = wide_value(wide, negative_anchor, positive_claim)
+    pos_anchor_neg_claim = wide_value(wide, positive_anchor, negative_claim)
+    neg_anchor_neg_claim = wide_value(wide, negative_anchor, negative_claim)
+
+    beta_pos = (pos_anchor_pos_claim - neg_anchor_pos_claim) / 2
+    gamma_pos = (pos_anchor_pos_claim + neg_anchor_pos_claim) / 2
+    beta_neg = (pos_anchor_neg_claim - neg_anchor_neg_claim) / 2
+    gamma_neg = (pos_anchor_neg_claim + neg_anchor_neg_claim) / 2
+
+    rows = []
+    for assumption_form in assumption_forms:
+        kappa_pos = safe_divide(wide_value(wide, assumption_form, positive_claim) - gamma_pos, beta_pos)
+        kappa_neg = safe_divide(wide_value(wide, assumption_form, negative_claim) - gamma_neg, beta_neg)
+        detail = pd.DataFrame(
+            {
+                "base_event_id": wide.index,
+                "assumption_form": assumption_form,
+                "beta_pos": beta_pos.to_numpy(),
+                "gamma_pos": gamma_pos.to_numpy(),
+                "beta_neg": beta_neg.to_numpy(),
+                "gamma_neg": gamma_neg.to_numpy(),
+                "kappa_pos": kappa_pos.to_numpy(),
+                "kappa_neg": kappa_neg.to_numpy(),
+            }
+        )
+        detail["kappa_hat"] = (detail["kappa_pos"] + detail["kappa_neg"]) / 2
+        detail["E_reuse"] = (detail["kappa_pos"] - detail["kappa_neg"]).abs()
+        detail["exceeds_negative_anchor"] = (detail["kappa_hat"] < -1).astype(int)
+        rows.append(detail)
+
+    detail_df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if detail_df.empty:
+        return detail_df, pd.DataFrame()
+    summary = (
+        detail_df.groupby("assumption_form", dropna=False)
+        .agg(
+            mean_beta_pos=("beta_pos", "mean"),
+            mean_gamma_pos=("gamma_pos", "mean"),
+            mean_beta_neg=("beta_neg", "mean"),
+            mean_gamma_neg=("gamma_neg", "mean"),
+            mean_kappa_pos=("kappa_pos", "mean"),
+            mean_kappa_neg=("kappa_neg", "mean"),
+            mean_kappa_hat=("kappa_hat", "mean"),
+            median_kappa_hat=("kappa_hat", "median"),
+            mean_E_reuse=("E_reuse", "mean"),
+            exceeds_negative_anchor_rate=("exceeds_negative_anchor", "mean"),
+            n=("base_event_id", "count"),
+        )
+        .reset_index()
+    )
+    return detail_df, summary
+
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    denom = denominator.copy()
+    denom = denom.where(denom.abs() > 1e-12)
+    return numerator / denom
+
+
+def paired_sign_acc(positive_claim_scores: pd.Series, negative_claim_scores: pd.Series) -> float | None:
+    if positive_claim_scores.empty or negative_claim_scores.empty:
+        return None
+    data = pd.DataFrame({"positive": positive_claim_scores, "negative": negative_claim_scores}).dropna()
+    if data.empty:
+        return None
+    return nullable_float(((data["positive"] < 0) & (data["negative"] > 0)).mean())
+
+
+def dataframe_means(df: pd.DataFrame, exclude: set[str] | None = None) -> dict[str, float | None]:
+    if df.empty:
+        return {}
+    exclude = exclude or set()
+    out = {}
+    for column in df.columns:
+        if column in exclude:
+            continue
+        numeric = pd.to_numeric(df[column], errors="coerce")
+        if numeric.notna().any():
+            out[column] = nullable_float(numeric.mean())
+    return out
+
+
+def coefficient_summary_dict(summary: pd.DataFrame) -> dict[str, dict[str, float | None]]:
+    if summary.empty:
+        return {}
+    out: dict[str, dict[str, float | None]] = {}
+    for _, row in summary.iterrows():
+        assumption_form = str(row["assumption_form"])
+        out[assumption_form] = {
+            "mean_kappa_hat": nullable_float(row.get("mean_kappa_hat")),
+            "mean_E_reuse": nullable_float(row.get("mean_E_reuse")),
+            "mean_beta_pos": nullable_float(row.get("mean_beta_pos")),
+            "mean_gamma_pos": nullable_float(row.get("mean_gamma_pos")),
+            "mean_beta_neg": nullable_float(row.get("mean_beta_neg")),
+            "mean_gamma_neg": nullable_float(row.get("mean_gamma_neg")),
+            "exceeds_negative_anchor_rate": nullable_float(row.get("exceeds_negative_anchor_rate")),
+        }
+    return out
+
+
+def exp6a_interpretation_rules() -> dict[str, str]:
+    return {
+        "strong_support": "DID_NOT, DID_NOT_EVER, and NEVER have similar kappa_hat, low E_reuse, and small G_anchor.",
+        "temporal_scope_contribution": "DID_NOT_EVER differs from DID_NOT while NEVER tracks DID_NOT_EVER with low E_reuse.",
+        "surface_lexical_leakage": "NEVER differs from DID_NOT_EVER, suggesting lexical form affects readout.",
+        "no_stable_coefficient": "High E_reuse means the form does not reuse across claim polarity.",
+        "anchor_contamination": "Large C_DID_NOT versus C_NEVER gaps indicate claim wording or lexical overlap effects.",
     }
 
 

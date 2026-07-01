@@ -120,8 +120,25 @@ def evaluate_rows(
     scored = scorer.score_prompts((row["prompt"] for row in rows), batch_size=batch_size, show_progress=show_progress)
     for row, metrics in zip(rows, scored):
         row.update(metrics)
+        apply_axis_metrics(row)
         row["is_correct"] = int(row["pred_label"] == row["expected_label"])
     return rows
+
+
+def apply_axis_metrics(row: dict[str, Any]) -> None:
+    r_value = row.get("R", row.get("R_claim"))
+    if r_value in (None, ""):
+        row["R_claim"] = r_value
+        row["R_axis"] = None
+        return
+
+    r_claim = float(r_value)
+    raw_sign = row.get("claim_axis_sign", 1)
+    claim_axis_sign = int(float(raw_sign)) if raw_sign not in (None, "") else 1
+    row["R"] = r_claim
+    row["R_claim"] = r_claim
+    row["claim_axis_sign"] = claim_axis_sign
+    row["R_axis"] = claim_axis_sign * r_claim
 
 
 def logits_to_metrics(row_logits: Any, label_tokens: LabelTokenConfig) -> dict[str, Any]:
@@ -138,6 +155,7 @@ def logits_to_metrics(row_logits: Any, label_tokens: LabelTokenConfig) -> dict[s
         "logit_F": values["F"],
         "logit_U": values["U"],
         "R": r_value,
+        "R_claim": r_value,
         "U_gap": u_gap,
         "pred_label": pred_label,
     }

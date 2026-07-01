@@ -9,27 +9,36 @@ from typing import Any, Iterable
 
 PREFERRED_COLUMNS = [
     "row_id",
+    "run_family",
     "sample_id",
     "base_event_id",
     "experiment",
+    "subexperiment",
+    "axis",
     "condition",
     "assumption",
     "claim",
     "prompt",
     "expected_label",
     "expected_R_sign",
+    "label_confidence",
     "claim_subject",
     "claim_verb_base",
     "claim_verb_past",
     "claim_object",
     "claim_arg_type",
     "claim_polarity",
+    "claim_form",
+    "claim_axis",
+    "claim_axis_sign",
     "source_subject",
     "source_verb_base",
     "source_verb_past",
     "source_object",
     "source_arg_type",
     "source_polarity",
+    "assumption_form",
+    "source_axis_sign",
     "overlap_type",
     "overlap_count",
     "same_subject",
@@ -47,6 +56,8 @@ PREFERRED_COLUMNS = [
     "sanity_type",
     "phase_relation",
     "phase_cos",
+    "verb_allowed_for_frequency",
+    "frequency_naturalness",
     "n_assumptions",
     "source1_subject",
     "source1_verb",
@@ -80,6 +91,8 @@ PREFERRED_COLUMNS = [
     "logit_F",
     "logit_U",
     "R",
+    "R_claim",
+    "R_axis",
     "U_gap",
     "pred_label",
     "is_correct",
@@ -96,6 +109,12 @@ def write_rows_csv(rows: list[dict[str, Any]], path: str | Path) -> Path:
         for row in rows:
             writer.writerow(row)
     return path
+
+
+def read_rows_csv(path: str | Path) -> list[dict[str, Any]]:
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
 def write_rows_jsonl(rows: Iterable[dict[str, Any]], path: str | Path) -> Path:

@@ -17,9 +17,18 @@ from .base import (
     all_events,
     build_prompt,
     compact_polarity,
+    did_not_ever,
+    did_not_often,
     event_metadata,
     format_assumptions,
+    hardly_ever,
+    neg,
+    never,
+    often,
     polarity_symbol,
+    pos,
+    rarely,
+    seldom,
     sentence,
 )
 
@@ -29,6 +38,7 @@ EXPERIMENTS = (
     "exp3_clean_selection",
     "exp4_cancellation",
     "exp5_object_bound_phase",
+    "exp6_negation_phase",
 )
 SUPPLEMENTAL_SECTIONS = (
     "exp2_counterbalanced_overlap",
@@ -47,6 +57,35 @@ SUPPLEMENTAL_SECTIONS_BY_EXPERIMENT = {
 }
 
 VERB_BY_BASE = {verb.base: verb for verb in VERBS}
+
+EXP6_EXPERIMENT = "exp6_negation_phase"
+EXP6A_SUBEXPERIMENT = "exp6a_absolute_negation"
+EXP6B_SUBEXPERIMENT = "exp6b_frequency_negation"
+EXP6B_ALLOWED_VERBS = ("visit", "explore", "enter")
+
+EXP6A_ASSUMPTION_FORMS = {
+    "AFF": {"fn": pos, "source_polarity": "positive", "axis_sign": 1},
+    "DID_NOT": {"fn": neg, "source_polarity": "negative", "axis_sign": -1},
+    "DID_NOT_EVER": {"fn": did_not_ever, "source_polarity": "negative", "axis_sign": -1},
+    "NEVER": {"fn": never, "source_polarity": "negative", "axis_sign": -1},
+}
+EXP6A_CLAIM_FORMS = {
+    "C_POS": {"fn": pos, "claim_polarity": "positive", "claim_axis_sign": 1, "claim_axis": "occurrence"},
+    "C_DID_NOT": {"fn": neg, "claim_polarity": "negative", "claim_axis_sign": -1, "claim_axis": "occurrence"},
+    "C_NEVER": {"fn": never, "claim_polarity": "negative", "claim_axis_sign": -1, "claim_axis": "occurrence"},
+}
+
+EXP6B_ASSUMPTION_FORMS = {
+    "OFTEN": {"fn": often, "source_polarity": "positive", "axis_sign": 1},
+    "DID_NOT_OFTEN": {"fn": did_not_often, "source_polarity": "negative", "axis_sign": -1},
+    "RARELY": {"fn": rarely, "source_polarity": "negative", "axis_sign": -1},
+    "SELDOM": {"fn": seldom, "source_polarity": "negative", "axis_sign": -1},
+    "HARDLY_EVER": {"fn": hardly_ever, "source_polarity": "negative", "axis_sign": -1},
+}
+EXP6B_CLAIM_FORMS = {
+    "C_OFTEN": {"fn": often, "claim_polarity": "positive", "claim_axis_sign": 1, "claim_axis": "frequency"},
+    "C_DID_NOT_OFTEN": {"fn": did_not_often, "claim_polarity": "negative", "claim_axis_sign": -1, "claim_axis": "frequency"},
+}
 
 
 def generate_suite(
@@ -79,6 +118,8 @@ def generate_suite(
             rows.extend(generate_exp4(base_id, claim_event, include_source_only=include_exp4_source_only))
         if "exp5_object_bound_phase" in selected:
             rows.extend(generate_exp5(base_id, claim_event, rng))
+        if "exp6_negation_phase" in selected:
+            rows.extend(generate_exp6a(base_id, claim_event))
 
     for idx, row in enumerate(rows):
         row["row_id"] = idx
@@ -417,6 +458,141 @@ def make_exp5_row(
     )
 
 
+def generate_exp6(
+    n_base_events: int = 20,
+    seed: int = 0,
+    base_events_from_csv: str | None = "none",
+    include_exp6a: bool = True,
+    include_exp6b: bool = False,
+    exp6b_allowed_verbs: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Generate the Exp6 rows independently from the main suite."""
+
+    base_items = load_or_sample_base_events(n_base_events, seed, base_events_from_csv)
+    rows: list[dict[str, Any]] = []
+    allowed_verbs = tuple(exp6b_allowed_verbs or EXP6B_ALLOWED_VERBS)
+    for base_id, event in base_items:
+        if include_exp6a:
+            rows.extend(generate_exp6a(base_id, event))
+        if include_exp6b:
+            rows.extend(generate_exp6b(base_id, event, allowed_verbs=allowed_verbs))
+
+    for idx, row in enumerate(rows):
+        row["row_id"] = idx
+    return rows
+
+
+def generate_exp6a(base_id: str, event: Event) -> list[dict[str, Any]]:
+    rows = []
+    for assumption_form, source_spec in EXP6A_ASSUMPTION_FORMS.items():
+        assumption = source_spec["fn"](event)
+        source_axis_sign = int(source_spec["axis_sign"])
+        for claim_form, claim_spec in EXP6A_CLAIM_FORMS.items():
+            claim = claim_spec["fn"](event)
+            expected_label, expected_sign, label_confidence = expected_exp6a(assumption_form, claim_form)
+            claim_axis_sign = int(claim_spec["claim_axis_sign"])
+            rows.append(
+                make_sample(
+                    sample_id=f"exp6a_{base_id}_{slug(assumption_form)}_{slug(claim_form)}",
+                    base_id=base_id,
+                    experiment=EXP6_EXPERIMENT,
+                    condition=f"{assumption_form}_{claim_form}",
+                    assumptions=[assumption],
+                    sources=[event],
+                    source_polarities=[source_spec["source_polarity"]],
+                    claim_event=event,
+                    claim_polarity=claim_spec["claim_polarity"],
+                    expected_label=expected_label,
+                    expected_R_sign=expected_sign,
+                    extra={
+                        "subexperiment": EXP6A_SUBEXPERIMENT,
+                        "axis": "occurrence",
+                        "assumption_form": assumption_form,
+                        "claim_form": claim_form,
+                        "claim_axis": claim_spec["claim_axis"],
+                        "source_axis_sign": source_axis_sign,
+                        "label_confidence": label_confidence,
+                        "phase_cos": source_axis_sign * claim_axis_sign,
+                        "verb_allowed_for_frequency": int(event.verb.base in EXP6B_ALLOWED_VERBS),
+                        "frequency_naturalness": "not_applicable",
+                    },
+                    claim_text=claim,
+                    claim_axis_sign=claim_axis_sign,
+                )
+            )
+    return rows
+
+
+def expected_exp6a(assumption_form: str, claim_form: str) -> tuple[str, int, str]:
+    if claim_form == "C_POS":
+        return ("T", 1, "hard") if assumption_form == "AFF" else ("F", -1, "hard")
+    if claim_form == "C_DID_NOT":
+        return ("F", -1, "hard") if assumption_form == "AFF" else ("T", 1, "hard")
+    if claim_form == "C_NEVER":
+        if assumption_form == "AFF":
+            return "F", -1, "hard"
+        if assumption_form == "DID_NOT":
+            return "T", 1, "diagnostic"
+        if assumption_form in {"DID_NOT_EVER", "NEVER"}:
+            return "T", 1, "hardish"
+    raise ValueError(f"Unknown Exp6A assumption/claim form: {assumption_form}/{claim_form}")
+
+
+def generate_exp6b(base_id: str, event: Event, allowed_verbs: Sequence[str] = EXP6B_ALLOWED_VERBS) -> list[dict[str, Any]]:
+    allowed = set(allowed_verbs)
+    if event.verb.base not in allowed:
+        return []
+
+    rows = []
+    for assumption_form, source_spec in EXP6B_ASSUMPTION_FORMS.items():
+        assumption = source_spec["fn"](event)
+        source_axis_sign = int(source_spec["axis_sign"])
+        for claim_form, claim_spec in EXP6B_CLAIM_FORMS.items():
+            claim = claim_spec["fn"](event)
+            expected_label, expected_sign, label_confidence = expected_exp6b(assumption_form, claim_form)
+            claim_axis_sign = int(claim_spec["claim_axis_sign"])
+            rows.append(
+                make_sample(
+                    sample_id=f"exp6b_{base_id}_{slug(assumption_form)}_{slug(claim_form)}",
+                    base_id=base_id,
+                    experiment=EXP6_EXPERIMENT,
+                    condition=f"{assumption_form}_{claim_form}",
+                    assumptions=[assumption],
+                    sources=[event],
+                    source_polarities=[source_spec["source_polarity"]],
+                    claim_event=event,
+                    claim_polarity=claim_spec["claim_polarity"],
+                    expected_label=expected_label,
+                    expected_R_sign=expected_sign,
+                    extra={
+                        "subexperiment": EXP6B_SUBEXPERIMENT,
+                        "axis": "frequency",
+                        "assumption_form": assumption_form,
+                        "claim_form": claim_form,
+                        "claim_axis": claim_spec["claim_axis"],
+                        "source_axis_sign": source_axis_sign,
+                        "label_confidence": label_confidence,
+                        "phase_cos": source_axis_sign * claim_axis_sign,
+                        "verb_allowed_for_frequency": 1,
+                        "frequency_naturalness": "strict_allowed",
+                    },
+                    claim_text=claim,
+                    claim_axis_sign=claim_axis_sign,
+                )
+            )
+    return rows
+
+
+def expected_exp6b(assumption_form: str, claim_form: str) -> tuple[str, int, str]:
+    if assumption_form == "OFTEN":
+        return ("T", 1, "hard") if claim_form == "C_OFTEN" else ("F", -1, "hard")
+    if assumption_form == "DID_NOT_OFTEN":
+        return ("F", -1, "hardish") if claim_form == "C_OFTEN" else ("T", 1, "hardish")
+    if assumption_form in {"RARELY", "SELDOM", "HARDLY_EVER"}:
+        return ("F", -1, "directional") if claim_form == "C_OFTEN" else ("T", 1, "directional")
+    raise ValueError(f"Unknown Exp6B assumption/claim form: {assumption_form}/{claim_form}")
+
+
 def make_sample(
     sample_id: str,
     base_id: str,
@@ -431,8 +607,10 @@ def make_sample(
     expected_R_sign: int,
     primary_source_index: int = 0,
     extra: dict[str, Any] | None = None,
+    claim_text: str | None = None,
+    claim_axis_sign: int = 1,
 ) -> dict[str, Any]:
-    claim = sentence(claim_event, claim_polarity)
+    claim = claim_text if claim_text is not None else sentence(claim_event, claim_polarity)
     row: dict[str, Any] = {
         "sample_id": sample_id,
         "base_event_id": base_id,
@@ -444,11 +622,14 @@ def make_sample(
         "expected_label": expected_label,
         "expected_R_sign": expected_R_sign,
         "claim_polarity": claim_polarity,
+        "claim_axis_sign": int(claim_axis_sign),
         "n_assumptions": len(assumptions),
         "logit_T": None,
         "logit_F": None,
         "logit_U": None,
         "R": None,
+        "R_claim": None,
+        "R_axis": None,
         "U_gap": None,
         "pred_label": None,
         "is_correct": None,

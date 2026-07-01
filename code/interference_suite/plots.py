@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .metrics import has_model_results, summarize_exp2
+from .metrics import has_model_results, summarize_exp2, summarize_exp6a, summarize_exp6b
 
 
 def plot_all(df: pd.DataFrame, output_dir: str | Path) -> list[Path]:
@@ -28,6 +28,8 @@ def plot_all(df: pd.DataFrame, output_dir: str | Path) -> list[Path]:
     paths.extend(plot_exp3(df, output_dir, plt, sns))
     paths.extend(plot_exp4(df, output_dir, plt, sns))
     paths.extend(plot_exp5(df, output_dir, plt, sns))
+    paths.extend(plot_exp6a(df, output_dir, plt, sns))
+    paths.extend(plot_exp6b(df, output_dir, plt, sns))
     paths.extend(plot_exp2_counterbalanced(df, output_dir, plt, sns))
     paths.extend(plot_exp4_order_permutation(df, output_dir, plt, sns))
     paths.extend(plot_exp4_unrelated_conflict(df, output_dir, plt, sns))
@@ -106,6 +108,8 @@ def plot_exp3(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
 
 
 def plot_exp4(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    if "source_only" not in df.columns:
+        return []
     exp = df[(df["experiment"] == "exp4_cancellation") & (df["source_only"] != 1)].copy()
     if exp.empty:
         return []
@@ -162,6 +166,241 @@ def plot_exp5(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
     sns.despine()
     return [save_current(output_dir / "exp5_object_bound_phase.png", plt)]
 
+
+
+def plot_exp6a(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    if "subexperiment" not in df.columns:
+        return []
+    exp = df[(df["experiment"] == "exp6_negation_phase") & (df["subexperiment"] == "exp6a_absolute_negation")].copy()
+    if exp.empty:
+        return []
+
+    if "R" not in exp.columns and "R_claim" in exp.columns:
+        exp["R"] = exp["R_claim"]
+    if "R_axis" not in exp.columns:
+        exp["claim_axis_sign"] = pd.to_numeric(exp.get("claim_axis_sign", 1), errors="coerce").fillna(1)
+        exp["R_axis"] = exp["claim_axis_sign"] * exp["R"]
+    if "assumption_form" not in exp.columns and "source_form" in exp.columns:
+        exp["assumption_form"] = exp["source_form"]
+
+    paths = []
+    assumption_order = ["AFF", "DID_NOT", "DID_NOT_EVER", "NEVER"]
+    claim_order = ["C_POS", "C_DID_NOT", "C_NEVER"]
+
+    plt.figure(figsize=(9, 4.8))
+    sns.barplot(data=exp, x="assumption_form", y="R", hue="claim_form", order=assumption_order, hue_order=claim_order, errorbar="se")
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 6A: R by assumption and claim form")
+    plt.ylabel("R = L_T - L_F")
+    paths.append(save_current(output_dir / "exp6a_R_by_form.png", plt))
+
+    plt.figure(figsize=(9, 4.8))
+    sns.barplot(data=exp, x="assumption_form", y="R_axis", hue="claim_form", order=assumption_order, hue_order=claim_order, errorbar="se")
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Exp 6A: R_axis by assumption and claim form")
+    plt.ylabel("R_axis = s_c R")
+    paths.append(save_current(output_dir / "exp6a_R_axis_by_form.png", plt))
+
+    summarize_exp6a(df, output_dir)
+
+    deltas_path = output_dir / "exp6a_deltas.csv"
+    if deltas_path.exists():
+        deltas = pd.read_csv(deltas_path)
+        delta_cols = ["delta_R_never_notever_C_POS", "delta_R_never_notever_C_DID_NOT"]
+        delta_means = pd.DataFrame(
+            {"delta": delta_cols, "mean_R_delta": [deltas[col].mean() for col in delta_cols if col in deltas.columns]}
+        )
+        if not delta_means.empty:
+            plt.figure(figsize=(6.5, 4))
+            sns.barplot(data=delta_means, x="delta", y="mean_R_delta")
+            plt.axhline(0, color="black", linewidth=1)
+            plt.xticks(rotation=20, ha="right")
+            plt.title("Exp 6A: NEVER minus DID_NOT_EVER")
+            plt.ylabel("Mean R delta")
+            paths.append(save_current(output_dir / "exp6a_never_notever_delta.png", plt))
+
+    coefficients_path = output_dir / "exp6a_coefficients.csv"
+    if coefficients_path.exists():
+        coefficients = pd.read_csv(coefficients_path)
+        if not coefficients.empty:
+            coefficients["assumption_form"] = pd.Categorical(coefficients["assumption_form"], categories=assumption_order, ordered=True)
+            coefficients = coefficients.sort_values("assumption_form")
+            plt.figure(figsize=(7.5, 4))
+            sns.barplot(data=coefficients, x="assumption_form", y="mean_kappa_hat", order=assumption_order)
+            plt.axhline(0, color="black", linewidth=1)
+            plt.axhline(-1, color="gray", linewidth=1, linestyle="--")
+            plt.axhline(1, color="gray", linewidth=1, linestyle="--")
+            plt.title("Exp 6A: normalized polarity coefficient κ_hat")
+            plt.ylabel("Mean κ_hat")
+            paths.append(save_current(output_dir / "exp6a_kappa_hat_coefficients.png", plt))
+
+            kappa_long = coefficients.melt(
+                id_vars=["assumption_form"],
+                value_vars=["mean_kappa_pos", "mean_kappa_neg"],
+                var_name="estimate",
+                value_name="mean_kappa",
+            )
+            kappa_long["estimate"] = kappa_long["estimate"].map(
+                {
+                    "mean_kappa_pos": "κ_pos from C_POS",
+                    "mean_kappa_neg": "κ_neg from C_DID_NOT",
+                }
+            )
+            plt.figure(figsize=(8, 4.2))
+            sns.barplot(data=kappa_long, x="assumption_form", y="mean_kappa", hue="estimate", order=assumption_order)
+            plt.axhline(0, color="black", linewidth=1)
+            plt.axhline(-1, color="gray", linewidth=1, linestyle="--")
+            plt.axhline(1, color="gray", linewidth=1, linestyle="--")
+            plt.title("Exp 6A: κ_pos and κ_neg by assumption form")
+            plt.ylabel("Mean κ")
+            plt.legend(title="")
+            paths.append(save_current(output_dir / "exp6a_kappa_pos_neg.png", plt))
+
+            plt.figure(figsize=(7.5, 4))
+            sns.barplot(data=coefficients, x="assumption_form", y="mean_E_reuse", order=assumption_order)
+            plt.axhline(0, color="black", linewidth=1)
+            plt.title("Exp 6A: coefficient reuse error E_reuse")
+            plt.ylabel("Mean E_reuse = |κ_pos - κ_neg|")
+            paths.append(save_current(output_dir / "exp6a_E_reuse.png", plt))
+
+    detail_path = output_dir / "exp6a_coefficients_by_base.csv"
+    if detail_path.exists():
+        detail = pd.read_csv(detail_path)
+        if not detail.empty:
+            detail["assumption_form"] = pd.Categorical(detail["assumption_form"], categories=assumption_order, ordered=True)
+            plt.figure(figsize=(6.2, 5.4))
+            sns.scatterplot(data=detail, x="kappa_pos", y="kappa_neg", hue="assumption_form", hue_order=assumption_order, alpha=0.75, s=35)
+            finite = detail[["kappa_pos", "kappa_neg"]].apply(pd.to_numeric, errors="coerce").to_numpy().ravel()
+            finite = finite[pd.notna(finite)]
+            if len(finite):
+                lo = min(-1.2, float(finite.min()) - 0.1)
+                hi = max(1.2, float(finite.max()) + 0.1)
+                plt.plot([lo, hi], [lo, hi], color="black", linewidth=1, linestyle="--")
+                plt.xlim(lo, hi)
+                plt.ylim(lo, hi)
+            plt.axhline(0, color="black", linewidth=0.8)
+            plt.axvline(0, color="black", linewidth=0.8)
+            plt.title("Exp 6A: coefficient reuse across claim polarity")
+            plt.xlabel("κ_pos from C_POS")
+            plt.ylabel("κ_neg from C_DID_NOT")
+            paths.append(save_current(output_dir / "exp6a_kappa_reuse_scatter.png", plt))
+
+    anchor_path = output_dir / "exp6a_anchor_control.csv"
+    if anchor_path.exists():
+        anchor = pd.read_csv(anchor_path)
+        value_cols = [col for col in anchor.columns if col != "base_event_id"]
+        if value_cols:
+            anchor_means = pd.DataFrame({"anchor_gap": value_cols, "mean_gap": [anchor[col].mean() for col in value_cols]})
+            plt.figure(figsize=(7, 4))
+            sns.barplot(data=anchor_means, x="anchor_gap", y="mean_gap")
+            plt.axhline(0, color="black", linewidth=1)
+            plt.xticks(rotation=20, ha="right")
+            plt.title("Exp 6A: anchor contamination G_anchor")
+            plt.ylabel("Mean G_anchor")
+            paths.append(save_current(output_dir / "exp6a_anchor_contamination.png", plt))
+
+    return paths
+
+
+def plot_exp6b(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
+    if "subexperiment" not in df.columns:
+        return []
+    exp = df[(df["experiment"] == "exp6_negation_phase") & (df["subexperiment"] == "exp6b_frequency_negation")].copy()
+    if exp.empty:
+        return []
+
+    if "R" not in exp.columns and "R_claim" in exp.columns:
+        exp["R"] = exp["R_claim"]
+    if "R_axis" not in exp.columns:
+        exp["claim_axis_sign"] = pd.to_numeric(exp.get("claim_axis_sign", 1), errors="coerce").fillna(1)
+        exp["R_axis"] = exp["claim_axis_sign"] * exp["R"]
+    if "assumption_form" not in exp.columns and "source_form" in exp.columns:
+        exp["assumption_form"] = exp["source_form"]
+
+    paths = []
+    assumption_order = ["OFTEN", "DID_NOT_OFTEN", "RARELY", "SELDOM", "HARDLY_EVER"]
+    claim_order = ["C_OFTEN", "C_DID_NOT_OFTEN"]
+
+    plt.figure(figsize=(10, 4.8))
+    sns.barplot(data=exp, x="assumption_form", y="R_axis", hue="claim_form", order=assumption_order, hue_order=claim_order, errorbar="se")
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xticks(rotation=15, ha="right")
+    plt.title("Exp 6B: R_axis by assumption and claim form")
+    plt.ylabel("R_axis = s_c R")
+    paths.append(save_current(output_dir / "exp6b_R_axis_by_form.png", plt))
+
+    plt.figure(figsize=(8.5, 4.4))
+    sns.barplot(data=exp, x="assumption_form", y="U_gap", order=assumption_order, errorbar="se")
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xticks(rotation=15, ha="right")
+    plt.title("Exp 6B: U_gap by assumption form")
+    plt.ylabel("U_gap = logit(U) - max(logit(T), logit(F))")
+    paths.append(save_current(output_dir / "exp6b_U_gap_by_assumption.png", plt))
+
+    summarize_exp6b(df, output_dir)
+
+    coefficients_path = output_dir / "exp6b_coefficients.csv"
+    if coefficients_path.exists():
+        coefficients = pd.read_csv(coefficients_path)
+        if not coefficients.empty:
+            coefficients["assumption_form"] = pd.Categorical(coefficients["assumption_form"], categories=assumption_order, ordered=True)
+            coefficients = coefficients.sort_values("assumption_form")
+            plt.figure(figsize=(8.5, 4.4))
+            sns.barplot(data=coefficients, x="assumption_form", y="mean_kappa_hat", order=assumption_order)
+            plt.axhline(0, color="black", linewidth=1)
+            plt.axhline(-1, color="gray", linewidth=1, linestyle="--")
+            plt.axhline(1, color="gray", linewidth=1, linestyle="--")
+            plt.xticks(rotation=15, ha="right")
+            plt.title("Exp 6B: frequency polarity coefficient spectrum κ_hat")
+            plt.ylabel("Mean κ_hat")
+            paths.append(save_current(output_dir / "exp6b_kappa_hat_spectrum.png", plt))
+
+            kappa_long = coefficients.melt(
+                id_vars=["assumption_form"],
+                value_vars=["mean_kappa_pos", "mean_kappa_neg"],
+                var_name="estimate",
+                value_name="mean_kappa",
+            )
+            kappa_long["estimate"] = kappa_long["estimate"].map(
+                {
+                    "mean_kappa_pos": "κ_pos from C_OFTEN",
+                    "mean_kappa_neg": "κ_neg from C_DID_NOT_OFTEN",
+                }
+            )
+            plt.figure(figsize=(9, 4.4))
+            sns.barplot(data=kappa_long, x="assumption_form", y="mean_kappa", hue="estimate", order=assumption_order)
+            plt.axhline(0, color="black", linewidth=1)
+            plt.axhline(-1, color="gray", linewidth=1, linestyle="--")
+            plt.axhline(1, color="gray", linewidth=1, linestyle="--")
+            plt.xticks(rotation=15, ha="right")
+            plt.title("Exp 6B: κ_pos and κ_neg by assumption form")
+            plt.ylabel("Mean κ")
+            plt.legend(title="")
+            paths.append(save_current(output_dir / "exp6b_kappa_pos_neg.png", plt))
+
+    detail_path = output_dir / "exp6b_coefficients_by_base.csv"
+    if detail_path.exists():
+        detail = pd.read_csv(detail_path)
+        if not detail.empty:
+            detail["assumption_form"] = pd.Categorical(detail["assumption_form"], categories=assumption_order, ordered=True)
+            plt.figure(figsize=(6.2, 5.4))
+            sns.scatterplot(data=detail, x="kappa_pos", y="kappa_neg", hue="assumption_form", hue_order=assumption_order, alpha=0.75, s=35)
+            finite = detail[["kappa_pos", "kappa_neg"]].apply(pd.to_numeric, errors="coerce").to_numpy().ravel()
+            finite = finite[pd.notna(finite)]
+            if len(finite):
+                lo = min(-1.2, float(finite.min()) - 0.1)
+                hi = max(1.2, float(finite.max()) + 0.1)
+                plt.plot([lo, hi], [lo, hi], color="black", linewidth=1, linestyle="--")
+                plt.xlim(lo, hi)
+                plt.ylim(lo, hi)
+            plt.axhline(0, color="black", linewidth=0.8)
+            plt.axvline(0, color="black", linewidth=0.8)
+            plt.title("Exp 6B: coefficient reuse across claim polarity")
+            plt.xlabel("κ_pos from C_OFTEN")
+            plt.ylabel("κ_neg from C_DID_NOT_OFTEN")
+            paths.append(save_current(output_dir / "exp6b_kappa_reuse_scatter.png", plt))
+
+    return paths
 
 
 def plot_exp2_counterbalanced(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
@@ -224,7 +463,8 @@ def plot_exp4_unrelated_conflict(df: pd.DataFrame, output_dir: Path, plt, sns) -
 def plot_exp4_duplicate_controls(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
     dup = df[df["experiment"] == "exp4_duplicate_controls"].copy()
     order_perm = df[df["experiment"] == "exp4_order_permutation"].copy()
-    controls = pd.concat([dup, order_perm[order_perm["source_only"] == 1]], ignore_index=True)
+    order_source_only = order_perm[order_perm["source_only"] == 1] if "source_only" in order_perm.columns else order_perm.iloc[0:0]
+    controls = pd.concat([dup, order_source_only], ignore_index=True)
     if controls.empty:
         return []
     order = ["+", "++", "-", "--"]

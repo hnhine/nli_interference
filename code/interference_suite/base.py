@@ -100,6 +100,41 @@ def neg(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None
     return f"{event.subject} did not {event.verb.base} {event.obj}."
 
 
+def did_not_ever(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} did not ever {event.verb.base} {event.obj}."
+
+
+def never(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} never {event.verb.past} {event.obj}."
+
+
+def often(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} often {event.verb.past} {event.obj}."
+
+
+def did_not_often(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} did not often {event.verb.base} {event.obj}."
+
+
+def rarely(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} rarely {event.verb.past} {event.obj}."
+
+
+def seldom(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} seldom {event.verb.past} {event.obj}."
+
+
+def hardly_ever(subject_or_event: str | Event, verb: VerbSpec | dict[str, object] | None = None, obj: str | None = None) -> str:
+    event = coerce_event(subject_or_event, verb, obj)
+    return f"{event.subject} hardly ever {event.verb.past} {event.obj}."
+
+
 def sentence(event: Event, polarity: Polarity) -> str:
     if polarity == "positive":
         return pos(event)
