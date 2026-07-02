@@ -204,12 +204,12 @@ def resolve_torch_dtype(torch: Any, dtype: str | None) -> Any:
     return mapping[dtype]
 
 
-def progress_iter(iterable: Iterable[int], total: int, desc: str):
+def progress_iter(iterable: Iterable[int], total: int, desc: str, unit: str = "batch"):
     try:
         from tqdm.auto import tqdm
     except ImportError:
         return iterable
-    return tqdm(iterable, total=total, desc=desc, unit="batch")
+    return tqdm(iterable, total=total, desc=desc, unit=unit)
 
 
 def normalize_cache_dir(cache_dir: str | None) -> str | None:

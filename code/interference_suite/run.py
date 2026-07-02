@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .das_data import DAS_TARGETS, generate_das_pairs
+from .das_pyvene import run_pyvene_das
 from .generation import EXPERIMENTS, generate_exp6, generate_suite, generate_supplements, supplemental_sections_for_experiments
 from .io_utils import read_rows_csv, write_rows_csv, write_rows_jsonl
 from .metrics import load_results, write_summary_outputs
@@ -79,6 +81,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote Exp6 summary outputs to {output_dir}")
         return 0
 
+    if args.command == "das-generate":
+        rows = build_das_rows_from_args(args)
+        output_dir = Path(args.output_dir)
+        csv_path = write_rows_csv(rows, output_dir / args.csv_name)
+        if args.jsonl:
+            write_rows_jsonl(rows, output_dir / args.jsonl_name)
+        print(f"Wrote {len(rows)} DAS pairs to {csv_path}")
+        return 0
+
+    if args.command == "das-run":
+        rows = read_rows_csv(args.samples)
+        if args.limit is not None:
+            rows = rows[: args.limit]
+        output_dir = Path(args.output_dir)
+        rank = args.rank if args.rank is not None else default_das_rank(args.target_var)
+        try:
+            summary = run_pyvene_das(
+                rows=rows,
+                output_dir=output_dir,
+                model_name=args.model_name,
+                target_var=args.target_var,
+                layer=args.layer,
+                rank=rank,
+                component=args.component,
+                site=args.site,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                eval_batch_size=args.eval_batch_size,
+                learning_rate=args.learning_rate,
+                seed=args.seed,
+                device=args.device,
+                device_map=args.device_map,
+                torch_dtype=args.torch_dtype,
+                label_token_style=args.label_token_style,
+                trust_remote_code=args.trust_remote_code,
+                cache_dir=args.cache_dir,
+                local_files_only=args.local_files_only,
+                eval_interval=args.eval_interval,
+                save_intervention=args.save_intervention,
+                export_rotation_weight=args.export_rotation_weight,
+                train_control_types=args.train_control_types,
+            )
+        except ImportError as exc:
+            print(f"DAS dependency error: {exc}")
+            return 2
+        print(f"Wrote DAS outputs to {output_dir}")
+        print(f"Test IIA: {summary['test']['IIA']}")
+        return 0
+
     if args.command == "summarize":
         df = load_results(args.input_csv)
         output_dir = Path(args.output_dir)
@@ -129,6 +180,23 @@ def build_exp6_rows_from_args(args: argparse.Namespace) -> list[dict[str, object
     for idx, row in enumerate(rows):
         row["row_id"] = idx
     return rows
+
+
+def build_das_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
+    targets = args.targets
+    if targets == ["all"]:
+        targets = list(DAS_TARGETS)
+    return generate_das_pairs(
+        n_base_events=args.n_base_events,
+        seed=args.seed,
+        targets=targets,
+        train_fraction=args.train_fraction,
+        val_fraction=args.val_fraction,
+    )
+
+
+def default_das_rank(target_var: str) -> int:
+    return 8 if target_var == "m" else 1
 
 
 def parse_exp6b_verbs(value: str) -> list[str]:
@@ -199,6 +267,34 @@ def build_parser() -> argparse.ArgumentParser:
     exp6_summarize.add_argument("--output-dir", default="data/exp6/summary")
     exp6_summarize.add_argument("--plots", action="store_true")
 
+    das_generate = subparsers.add_parser("das-generate", help="Generate base/source DAS pairs for pc, pi, and m interventions.")
+    add_das_generation_args(das_generate)
+    das_generate.add_argument("--jsonl", action="store_true", help="Also write JSONL output.")
+
+    das_run = subparsers.add_parser("das-run", help="Train and evaluate a pyvene DAS intervention for one target variable.")
+    das_run.add_argument("--samples", required=True, help="DAS pairs CSV from das-generate.")
+    das_run.add_argument("--output-dir", default="data/das/run")
+    das_run.add_argument("--target-var", required=True, choices=DAS_TARGETS)
+    das_run.add_argument("--layer", type=int, required=True)
+    das_run.add_argument("--rank", type=int, default=None, help="DAS rank. Defaults to 1 for pc/pi and 8 for m.")
+    das_run.add_argument("--component", default="block_output")
+    das_run.add_argument("--site", default="row", help="Use row-specific sites, or override with claim_final, answer_token, a1_final, etc.")
+    das_run.add_argument("--steps", type=int, default=1000)
+    das_run.add_argument("--eval-batch-size", type=int, default=None)
+    das_run.add_argument("--learning-rate", type=float, default=1e-3)
+    das_run.add_argument("--eval-interval", type=int, default=100)
+    das_run.add_argument("--seed", type=int, default=0)
+    das_run.add_argument("--limit", type=int, default=None, help="Use only the first N rows from --samples.")
+    das_run.add_argument("--save-intervention", action="store_true")
+    das_run.add_argument("--export-rotation-weight", action="store_true", help="Write rotation_weight.pt/.npy and metadata to --output-dir.")
+    das_run.add_argument(
+        "--train-control-types",
+        nargs="+",
+        default=["auto"],
+        help="Control types used for training. auto uses main for pc/pi and both m directions for m; use all to train every row.",
+    )
+    add_model_args(das_run)
+
     summarize = subparsers.add_parser("summarize", help="Summarize an existing full-suite scored CSV.")
     summarize.add_argument("--input-csv", required=True)
     summarize.add_argument("--output-dir", default="interference/data/summary")
@@ -229,6 +325,17 @@ def add_exp6_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", default="data/exp6")
     parser.add_argument("--csv-name", default="samples.csv")
     parser.add_argument("--jsonl-name", default="samples.jsonl")
+
+
+def add_das_generation_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--n-base-events", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--targets", nargs="+", default=["all"], choices=["all", *DAS_TARGETS])
+    parser.add_argument("--train-fraction", type=float, default=0.70)
+    parser.add_argument("--val-fraction", type=float, default=0.15)
+    parser.add_argument("--output-dir", default="data/das/generated")
+    parser.add_argument("--csv-name", default="pairs.csv")
+    parser.add_argument("--jsonl-name", default="pairs.jsonl")
 
 
 def add_generation_args(parser: argparse.ArgumentParser) -> None:

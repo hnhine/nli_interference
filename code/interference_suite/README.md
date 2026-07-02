@@ -109,3 +109,29 @@ python code/run_interference_suite.py run \
 
 This produces about `75 * n_base_events` rows by default: original suite rows including Exp6A, plus Exp2 counterbalanced overlap plus Exp4 order-permutation, unrelated-conflict, and duplicate-control supplements. For 1000 base events, that is about 75,000 rows. The single merged summary lives at `summary/summary_metrics.json`.
 
+## DAS With pyvene
+
+Generate base/source counterfactual pairs for the atomic causal model (`p_c`, `p_i`, `m_i`):
+
+```bash
+python code/run_interference_suite.py das-generate \
+  --n-base-events 20 \
+  --output-dir data/das/generated
+```
+
+Train one DAS intervention with `pyvene`:
+
+```bash
+python code/run_interference_suite.py das-run \
+  --samples data/das/generated/pairs.csv \
+  --model-name Qwen/Qwen3-8B \
+  --target-var pc \
+  --layer 24 \
+  --rank 1 \
+  --batch-size 16 \
+  --steps 1000 \
+  --output-dir data/das/qwen3_8_pc_l24_r1 \
+  --local-files-only
+```
+
+`das-run` keeps the base model frozen and trains only the pyvene low-rank rotated intervention. The default row sites are `claim_final` for `p_c` and `m_i`, and the matched assumption final token for `p_i`; pass `--site answer_token` or another site to run controls.
