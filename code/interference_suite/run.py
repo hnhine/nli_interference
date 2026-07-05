@@ -8,6 +8,7 @@ from pathlib import Path
 from .das_data import DAS_TARGETS, generate_das_pairs
 from .das_pyvene import run_pyvene_das
 from .generation import EXPERIMENTS, generate_exp6, generate_suite, generate_supplements, supplemental_sections_for_experiments
+from .hidden_dump import dump_das_hidden_states
 from .io_utils import read_rows_csv, write_rows_csv, write_rows_jsonl
 from .metrics import load_results, write_summary_outputs
 from .model import DEFAULT_CACHE_DIR, evaluate_rows
@@ -128,6 +129,38 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"Wrote DAS outputs to {output_dir}")
         print(f"Test IIA: {summary['test']['IIA']}")
+        return 0
+
+
+    if args.command == "das-dump-hidden":
+        rows = read_rows_csv(args.samples)
+        try:
+            summary = dump_das_hidden_states(
+                rows=rows,
+                output_dir=args.output_dir,
+                model_name=args.model_name,
+                target_var=args.target_var,
+                layer=args.layer,
+                component=args.component,
+                site=args.site,
+                split=args.split,
+                control_types=args.control_types,
+                limit=None if args.limit == -1 else args.limit,
+                batch_size=args.batch_size,
+                device=args.device,
+                device_map=args.device_map,
+                torch_dtype=args.torch_dtype,
+                trust_remote_code=args.trust_remote_code,
+                cache_dir=args.cache_dir,
+                local_files_only=args.local_files_only,
+            )
+        except ImportError as exc:
+            print(f"Hidden dump dependency error: {exc}")
+            return 2
+        print(f"Wrote raw hidden states to {summary['tensor_path']}")
+        print(f"Hidden shape: {summary['hidden_shape']}")
+        print(f"Metadata: {summary['metadata_path']}")
+        print(f"Summary CSV: {summary['summary_csv']}")
         return 0
 
     if args.command == "summarize":
@@ -294,6 +327,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Control types used for training. auto uses main for pc/pi and both m directions for m; use all to train every row.",
     )
     add_model_args(das_run)
+
+
+    das_hidden = subparsers.add_parser("das-dump-hidden", help="Dump raw HF hidden states for DAS base/source rows without pyvene intervention.")
+    das_hidden.add_argument("--samples", required=True, help="DAS pairs CSV from das-generate.")
+    das_hidden.add_argument("--output-dir", default="data/das/hidden_dump")
+    das_hidden.add_argument("--target-var", required=True, choices=DAS_TARGETS)
+    das_hidden.add_argument("--layer", type=int, required=True)
+    das_hidden.add_argument("--component", default="block_output", choices=["block_input", "block_output"], help="Raw output_hidden_states component to dump.")
+    das_hidden.add_argument("--site", default="row", help="Use row-specific sites, or override with claim_final, answer_token, a1_final, etc.")
+    das_hidden.add_argument("--split", default="val", choices=["all", "train", "val", "test"])
+    das_hidden.add_argument("--control-types", nargs="+", default=["all"], help="Control types to dump, e.g. main gate_m0 label_copy_trap; use all for no filter.")
+    das_hidden.add_argument("--limit", type=int, default=16, help="Dump only the first N matching rows; use -1 for all rows.")
+    add_model_args(das_hidden)
 
     summarize = subparsers.add_parser("summarize", help="Summarize an existing full-suite scored CSV.")
     summarize.add_argument("--input-csv", required=True)

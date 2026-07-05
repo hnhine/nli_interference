@@ -6,9 +6,9 @@ import random
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from .base import Event, Polarity, build_prompt, event_metadata, format_assumptions, polarity_symbol, sentence
+from .base import PERSONS, VERBS, Event, Polarity, build_prompt, event_metadata, format_assumptions, polarity_symbol, sentence
 from .das_spans import add_span_columns, build_prompt_with_spans
-from .generation import choose_other, choose_other_verb, clean_distractors, sample_base_events
+from .generation import clean_distractors, sample_base_events
 
 DAS_TARGETS = ("pc", "pi", "m")
 POLARITIES: tuple[Polarity, Polarity] = ("positive", "negative")
@@ -63,16 +63,32 @@ def generate_das_pairs(
     base_events = sample_base_events(n_base_events, rng)
     rows: list[dict[str, Any]] = []
 
+    # Held-out claims must not be pre-exposed: train prompts may not contain
+    # val/test base events, and val prompts may not contain test base events
+    # (as distractors or mismatch events). The reverse direction is harmless,
+    # and the event pool is too small for symmetric exclusion.
+    splits = [split_for_index(idx, len(base_events), train_fraction, val_fraction) for idx in range(len(base_events))]
+    keys_by_split: dict[str, set[str]] = {}
+    for event, event_split in zip(base_events, splits):
+        keys_by_split.setdefault(event_split, set()).add(event.key)
+    split_order = {"train": 0, "val": 1, "test": 2}
+
     for base_index, claim_event in enumerate(base_events):
         base_id = f"base_{base_index:04d}"
-        split = split_for_index(base_index, len(base_events), train_fraction, val_fraction)
+        split = splits[base_index]
+        excluded_keys = frozenset(
+            key
+            for later_split, keys in keys_by_split.items()
+            if split_order[later_split] > split_order[split]
+            for key in keys
+        )
         for matched_idx in (0, 1, 2):
             if "pc" in selected:
-                rows.extend(generate_pc_pairs(base_id, split, claim_event, matched_idx, rng))
+                rows.extend(generate_pc_pairs(base_id, split, claim_event, matched_idx, rng, excluded_keys))
             if "pi" in selected:
-                rows.extend(generate_pi_pairs(base_id, split, claim_event, matched_idx, rng))
+                rows.extend(generate_pi_pairs(base_id, split, claim_event, matched_idx, rng, excluded_keys))
             if "m" in selected:
-                rows.extend(generate_m_pairs(base_id, split, claim_event, matched_idx, rng))
+                rows.extend(generate_m_pairs(base_id, split, claim_event, matched_idx, rng, excluded_keys))
 
     for idx, row in enumerate(rows):
         row["row_id"] = idx
@@ -80,12 +96,19 @@ def generate_das_pairs(
     return rows
 
 
-def generate_pc_pairs(base_id: str, split: str, claim_event: Event, matched_idx: int, rng: random.Random) -> list[dict[str, Any]]:
+def generate_pc_pairs(
+    base_id: str,
+    split: str,
+    claim_event: Event,
+    matched_idx: int,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for p_i in POLARITIES:
         for p_c_base in POLARITIES:
             p_c_src = flip_polarity(p_c_base)
-            base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i, p_c=p_c_base, rng=rng)
+            base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i, p_c=p_c_base, rng=rng, excluded_keys=excluded_keys)
             source = make_example(
                 claim_event,
                 matched_idx,
@@ -113,7 +136,7 @@ def generate_pc_pairs(base_id: str, split: str, claim_event: Event, matched_idx:
                 )
             )
 
-            no_match = make_example(claim_event, matched_idx, m_i=0, p_i=p_i, p_c=p_c_base, rng=rng)
+            no_match = make_example(claim_event, matched_idx, m_i=0, p_i=p_i, p_c=p_c_base, rng=rng, excluded_keys=excluded_keys)
             no_match_source = make_example(
                 claim_event,
                 matched_idx,
@@ -147,6 +170,7 @@ def generate_pc_pairs(base_id: str, split: str, claim_event: Event, matched_idx:
                 p_i=p_i,
                 p_c=p_c_src,
                 rng=rng,
+                excluded_keys=excluded_keys,
             )
             rows.append(
                 make_pair_row(
@@ -166,12 +190,19 @@ def generate_pc_pairs(base_id: str, split: str, claim_event: Event, matched_idx:
     return rows
 
 
-def generate_pi_pairs(base_id: str, split: str, claim_event: Event, matched_idx: int, rng: random.Random) -> list[dict[str, Any]]:
+def generate_pi_pairs(
+    base_id: str,
+    split: str,
+    claim_event: Event,
+    matched_idx: int,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for p_i_base in POLARITIES:
         for p_c in POLARITIES:
             p_i_src = flip_polarity(p_i_base)
-            base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i_base, p_c=p_c, rng=rng)
+            base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i_base, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
             source_polarities = replace_tuple(base.assumption_polarities, matched_idx, p_i_src)
             source = make_example(
                 claim_event,
@@ -236,8 +267,8 @@ def generate_pi_pairs(base_id: str, split: str, claim_event: Event, matched_idx:
                 )
             )
 
-            no_match_base = make_example(claim_event, matched_idx, m_i=0, p_i=p_i_base, p_c=p_c, rng=rng)
-            label_copy_source = make_example(claim_event, matched_idx, m_i=1, p_i=p_i_src, p_c=p_c, rng=rng)
+            no_match_base = make_example(claim_event, matched_idx, m_i=0, p_i=p_i_base, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
+            label_copy_source = make_example(claim_event, matched_idx, m_i=1, p_i=p_i_src, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
             rows.append(
                 make_pair_row(
                     sample_id=sample_id("pi", base_id, matched_idx, p_i_base, p_c, "label_copy_trap"),
@@ -256,13 +287,27 @@ def generate_pi_pairs(base_id: str, split: str, claim_event: Event, matched_idx:
     return rows
 
 
-def generate_m_pairs(base_id: str, split: str, claim_event: Event, matched_idx: int, rng: random.Random) -> list[dict[str, Any]]:
+def generate_m_pairs(
+    base_id: str,
+    split: str,
+    claim_event: Event,
+    matched_idx: int,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for p_i in POLARITIES:
         for p_c in POLARITIES:
             for mismatch_type in MISMATCH_TYPES:
-                matched_base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i, p_c=p_c, rng=rng)
-                mismatch_event = make_mismatch_event(claim_event, mismatch_type, rng)
+                matched_base = make_example(claim_event, matched_idx, m_i=1, p_i=p_i, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
+                try:
+                    mismatch_event = make_mismatch_event(claim_event, mismatch_type, rng, excluded_keys)
+                    mismatch_exclusion_relaxed = 0
+                except ValueError:
+                    # The condition requires this mismatch type; keep it and flag
+                    # the row so contaminated pairs can be audited or filtered.
+                    mismatch_event = make_mismatch_event(claim_event, mismatch_type, rng)
+                    mismatch_exclusion_relaxed = 1
                 source_events = replace_tuple(matched_base.assumption_events, matched_idx, mismatch_event)
                 no_match_source = make_example(
                     claim_event,
@@ -288,6 +333,7 @@ def generate_m_pairs(base_id: str, split: str, claim_event: Event, matched_idx: 
                         source_site="claim_final",
                         extra={
                             "mismatch_type": mismatch_type,
+                            "mismatch_exclusion_relaxed": mismatch_exclusion_relaxed,
                             "m_src": no_match_source.m_i,
                             "p_i_src": no_match_source.p_i,
                             "p_c_src": no_match_source.p_c,
@@ -330,6 +376,7 @@ def generate_m_pairs(base_id: str, split: str, claim_event: Event, matched_idx: 
                         source_site="claim_final",
                         extra={
                             "mismatch_type": mismatch_type,
+                            "mismatch_exclusion_relaxed": mismatch_exclusion_relaxed,
                             "m_src": match_source.m_i,
                             "p_i_src": match_source.p_i,
                             "p_c_src": match_source.p_c,
@@ -363,6 +410,7 @@ def generate_m_pairs(base_id: str, split: str, claim_event: Event, matched_idx: 
                         source_site="claim_final",
                         extra={
                             "mismatch_type": mismatch_type,
+                            "mismatch_exclusion_relaxed": mismatch_exclusion_relaxed,
                             "m_src": label_copy_source.m_i,
                             "p_i_src": label_copy_source.p_i,
                             "p_c_src": label_copy_source.p_c,
@@ -381,10 +429,11 @@ def make_example(
     rng: random.Random,
     assumption_events: Sequence[Event] | None = None,
     assumption_polarities: Sequence[Polarity] | None = None,
+    excluded_keys: frozenset[str] = frozenset(),
 ) -> DasExample:
     if assumption_events is None:
-        slot_event = claim_event if m_i == 1 else make_mismatch_event(claim_event, "object", rng)
-        events = assumption_events_for_slot(claim_event, matched_idx, slot_event, rng)
+        slot_event = claim_event if m_i == 1 else make_no_match_slot_event(claim_event, rng, excluded_keys)
+        events = assumption_events_for_slot(claim_event, matched_idx, slot_event, rng, excluded_keys)
     else:
         events = tuple(assumption_events)
 
@@ -466,8 +515,14 @@ def make_pair_row(
     return row
 
 
-def assumption_events_for_slot(claim_event: Event, matched_idx: int, slot_event: Event, rng: random.Random) -> tuple[Event, ...]:
-    distractors = iter(clean_distractors(claim_event, rng, count=2))
+def assumption_events_for_slot(
+    claim_event: Event,
+    matched_idx: int,
+    slot_event: Event,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> tuple[Event, ...]:
+    distractors = iter(clean_distractors(claim_event, rng, count=2, excluded_keys=excluded_keys))
     events: list[Event] = []
     for idx in range(3):
         events.append(slot_event if idx == matched_idx else next(distractors))
@@ -484,19 +539,59 @@ def default_polarities(matched_idx: int, p_i: Polarity) -> tuple[Polarity, ...]:
     return tuple(polarities)
 
 
-def make_mismatch_event(claim_event: Event, mismatch_type: str, rng: random.Random) -> Event:
-    if mismatch_type == "object":
-        return Event(claim_event.subject, claim_event.verb, choose_other(claim_event.verb.candidates, claim_event.obj, rng))
-    if mismatch_type == "subject":
-        from .base import PERSONS
+def make_no_match_slot_event(
+    claim_event: Event,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> Event:
+    """Pick a non-matching slot event, preferring near-miss mismatches.
 
-        return Event(choose_other(PERSONS, claim_event.subject, rng), claim_event.verb, claim_event.obj)
-    if mismatch_type == "verb":
-        verb = choose_other_verb(claim_event.verb, rng, same_arg_type=True)
-        return Event(claim_event.subject, verb, claim_event.obj)
-    if mismatch_type == "no_overlap":
-        return clean_distractors(claim_event, rng, count=1)[0]
-    raise ValueError(f"Unknown mismatch type: {mismatch_type}")
+    Any mismatch type is semantically valid for an m=0 slot; the fallback chain
+    only matters when exclusions exhaust the tiny object-candidate pool.
+    """
+
+    for mismatch_type in ("object", "subject", "no_overlap"):
+        try:
+            return make_mismatch_event(claim_event, mismatch_type, rng, excluded_keys)
+        except ValueError:
+            continue
+    raise ValueError(f"No no-match slot event available for {claim_event.key}")
+
+
+def make_mismatch_event(
+    claim_event: Event,
+    mismatch_type: str,
+    rng: random.Random,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> Event:
+    if mismatch_type == "object":
+        candidates = [
+            Event(claim_event.subject, claim_event.verb, obj)
+            for obj in claim_event.verb.candidates
+            if obj != claim_event.obj
+        ]
+    elif mismatch_type == "subject":
+        candidates = [
+            Event(subject, claim_event.verb, claim_event.obj)
+            for subject in PERSONS
+            if subject != claim_event.subject
+        ]
+    elif mismatch_type == "verb":
+        candidates = [
+            Event(claim_event.subject, verb, claim_event.obj)
+            for verb in VERBS
+            if verb.base != claim_event.verb.base and verb.arg_type == claim_event.verb.arg_type
+        ]
+    elif mismatch_type == "no_overlap":
+        return clean_distractors(claim_event, rng, count=1, excluded_keys=excluded_keys)[0]
+    else:
+        raise ValueError(f"Unknown mismatch type: {mismatch_type}")
+    candidates = [event for event in candidates if event.key not in excluded_keys]
+    if not candidates:
+        raise ValueError(
+            f"No {mismatch_type} mismatch candidate left for {claim_event.key} after excluding cross-split base events"
+        )
+    return rng.choice(candidates)
 
 
 def replace_tuple(values: Sequence[Any], idx: int, value: Any) -> tuple[Any, ...]:

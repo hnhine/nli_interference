@@ -712,13 +712,19 @@ def exp4_extra(polarities: Sequence[Polarity], q_value: int, source_only: bool) 
     }
 
 
-def clean_distractors(claim_event: Event, rng: random.Random, count: int) -> list[Event]:
+def clean_distractors(
+    claim_event: Event,
+    rng: random.Random,
+    count: int,
+    excluded_keys: frozenset[str] | set[str] = frozenset(),
+) -> list[Event]:
     candidates = [
         event
         for event in all_events()
         if event.subject != claim_event.subject
         and event.verb.base != claim_event.verb.base
         and event.obj != claim_event.obj
+        and event.key not in excluded_keys
     ]
     rng.shuffle(candidates)
     unique: list[Event] = []

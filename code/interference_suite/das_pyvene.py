@@ -41,6 +41,9 @@ def run_pyvene_das(
     save_intervention: bool = False,
     export_rotation_weight: bool = False,
     train_control_types: list[str] | None = None,
+    model: Any | None = None,
+    tokenizer: Any | None = None,
+    eval_train: bool = True,
 ) -> dict[str, Any]:
     torch, pv, AutoModelForCausalLM, AutoTokenizer = import_runtime()
     output_dir = Path(output_dir)
@@ -58,18 +61,19 @@ def run_pyvene_das(
     if not train_rows:
         raise ValueError(f"No train rows found for target_var={target_var!r}")
 
-    tokenizer, model = load_hf_model(
-        torch=torch,
-        auto_model_cls=AutoModelForCausalLM,
-        auto_tokenizer_cls=AutoTokenizer,
-        model_name=model_name,
-        device=device,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        trust_remote_code=trust_remote_code,
-        cache_dir=cache_dir,
-        local_files_only=local_files_only,
-    )
+    if model is None or tokenizer is None:
+        tokenizer, model = load_hf_model(
+            torch=torch,
+            auto_model_cls=AutoModelForCausalLM,
+            auto_tokenizer_cls=AutoTokenizer,
+            model_name=model_name,
+            device=device,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
     label_tokens = resolve_label_tokens(tokenizer, label_token_style)
     intervenable = build_intervenable(pv, model, layer=layer, rank=rank, component=component)
     input_device = get_input_device(model, torch, device)
@@ -131,9 +135,12 @@ def run_pyvene_das(
                 )
             print(json.dumps(entry, sort_keys=True))
 
-    train_metrics, _ = evaluate_pyvene_das(
-        intervenable, train_rows, tokenizer, torch, input_device, label_tokens.token_ids, eval_batch_size, site, "Final train"
-    )
+    if eval_train:
+        train_metrics, _ = evaluate_pyvene_das(
+            intervenable, train_rows, tokenizer, torch, input_device, label_tokens.token_ids, eval_batch_size, site, "Final train"
+        )
+    else:
+        train_metrics = None
     val_metrics, val_scored = evaluate_pyvene_das(
         intervenable, val_rows, tokenizer, torch, input_device, label_tokens.token_ids, eval_batch_size, site, "Final val"
     )
@@ -211,17 +218,21 @@ def evaluate_pyvene_das(
     row_chunks = chunks(rows, batch_size)
     if progress_desc:
         row_chunks = progress_iter(row_chunks, total=ceil(len(rows) / batch_size), desc=progress_desc)
+    label_id_set = set(label_token_ids.values())
     for batch_rows in row_chunks:
         batch = collate_rows(batch_rows, tokenizer, torch, device, site_override)
         with torch.no_grad():
             outputs = call_intervenable(intervenable, batch)
-            tfu_logits = tfu_logits_from_outputs(torch, outputs, batch["input_lengths"], label_token_ids)
+            next_logits = next_token_logits(torch, outputs, batch["input_lengths"])
+            tfu_logits = tfu_logits_from_next(torch, next_logits, label_token_ids)
+            global_top_ids = next_logits.argmax(dim=-1)
         preds = tfu_logits.argmax(dim=-1)
-        for row, row_logits, pred_idx in zip(batch_rows, tfu_logits, preds):
+        for row, row_logits, pred_idx, top_id in zip(batch_rows, tfu_logits, preds, global_top_ids):
             logit_t = float(row_logits[0].detach().cpu())
             logit_f = float(row_logits[1].detach().cpu())
             logit_u = float(row_logits[2].detach().cpu())
             pred_label = INDEX_TO_LABEL[int(pred_idx.detach().cpu())]
+            top_token_id = int(top_id.detach().cpu())
             out = dict(row)
             out.update(
                 {
@@ -232,6 +243,9 @@ def evaluate_pyvene_das(
                     "U_gap": logit_u - max(logit_t, logit_f),
                     "pred_label": pred_label,
                     "is_correct": int(pred_label == row["target_label"]),
+                    "global_top_token_id": top_token_id,
+                    "global_top_token": tokenizer.decode([top_token_id]),
+                    "global_top_in_TFU": int(top_token_id in label_id_set),
                 }
             )
             scored.append(out)
@@ -280,10 +294,18 @@ def call_intervenable(intervenable: Any, batch: dict[str, Any]) -> Any:
 
 
 def tfu_logits_from_outputs(torch: Any, outputs: Any, input_lengths: Any, label_token_ids: dict[str, int]) -> Any:
+    next_logits = next_token_logits(torch, outputs, input_lengths)
+    return tfu_logits_from_next(torch, next_logits, label_token_ids)
+
+
+def next_token_logits(torch: Any, outputs: Any, input_lengths: Any) -> Any:
     logits = extract_logits(outputs)
     batch_idx = torch.arange(logits.shape[0], device=logits.device)
     final_idx = input_lengths.to(logits.device) - 1
-    next_logits = logits[batch_idx, final_idx]
+    return logits[batch_idx, final_idx]
+
+
+def tfu_logits_from_next(torch: Any, next_logits: Any, label_token_ids: dict[str, int]) -> Any:
     return torch.stack(
         [
             next_logits[:, label_token_ids["T"]],
@@ -638,6 +660,9 @@ def summarize_scored(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "IIA": mean(float(row["is_correct"]) for row in control_rows),
             "mean_R": mean(float(row["R"]) for row in control_rows),
             "mean_U_gap": mean(float(row["U_gap"]) for row in control_rows),
+            "global_top_in_TFU_rate": mean(
+                float(row["global_top_in_TFU"]) for row in control_rows if "global_top_in_TFU" in row
+            ),
         }
     return {
         "n": len(rows),
@@ -647,6 +672,7 @@ def summarize_scored(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "T_rate": pred_counts["T"] / len(rows),
         "F_rate": pred_counts["F"] / len(rows),
         "U_rate": pred_counts["U"] / len(rows),
+        "global_top_in_TFU_rate": mean(float(row["global_top_in_TFU"]) for row in rows if "global_top_in_TFU" in row),
         "by_control": by_control,
     }
 
