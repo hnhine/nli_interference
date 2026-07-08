@@ -68,6 +68,7 @@ def main() -> int:
                 model=model,
                 tokenizer=tokenizer,
                 eval_train=False,
+                export_rotation_weight=True,
             )
             cells.append(cell_record(layer, site, summary))
             aggregate_path.write_text(json.dumps(to_jsonable(cells), indent=2), encoding="utf-8")
