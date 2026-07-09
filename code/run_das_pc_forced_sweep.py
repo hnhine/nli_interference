@@ -41,8 +41,8 @@ def build_rows(args: argparse.Namespace) -> list[dict]:
     return rows
 
 
-def cell_record(layer: int, summary: dict) -> dict:
-    record: dict = {"layer": layer}
+def cell_record(layer: int, site: str, summary: dict) -> dict:
+    record: dict = {"layer": layer, "site": site}
     for split in ("val", "test"):
         by_control = (summary.get(split) or {}).get("by_control") or {}
         for control in CONTROLS:
@@ -63,15 +63,15 @@ def write_outputs(records: list[dict], output_dir: Path) -> None:
 
 
 def print_table(records: list[dict]) -> None:
-    header = "layer | " + " | ".join(f"{control:>18s}" for control in CONTROLS) + " (test IIA)"
+    header = f"{'layer':>5s} {'site':>14s} | " + " | ".join(f"{control:>18s}" for control in CONTROLS) + " (test IIA)"
     print("\n" + header)
     print("-" * len(header))
-    for record in sorted(records, key=lambda r: r["layer"]):
+    for record in sorted(records, key=lambda r: (r.get("site", ""), r["layer"])):
         cells = []
         for control in CONTROLS:
             value = record.get(f"test_{control}_IIA")
             cells.append(f"{value:>18.4f}" if value is not None else f"{'-':>18s}")
-        print(f"{record['layer']:>5} | " + " | ".join(cells))
+        print(f"{record['layer']:>5} {record.get('site',''):>14s} | " + " | ".join(cells))
 
 
 def main() -> int:
@@ -97,32 +97,33 @@ def main() -> int:
 
     records: list[dict] = []
     for layer in args.layers:
-        print(f"\n=== p_c-forced training @ layer {layer} ===")
-        summary = run_pyvene_das(
-            rows=rows,
-            output_dir=output_dir / f"L{layer:02d}",
-            model_name=args.model_name,
-            target_var="pc",
-            layer=layer,
-            rank=args.rank,
-            site="claim_final",
-            steps=args.steps,
-            batch_size=args.batch_size,
-            eval_batch_size=args.eval_batch_size,
-            learning_rate=args.learning_rate,
-            seed=args.seed,
-            eval_interval=args.eval_interval,
-            train_control_types=["all"],
-            export_rotation_weight=True,
-            model=model,
-            tokenizer=tokenizer,
-            eval_train=False,
-        )
-        records.append(cell_record(layer, summary))
-        write_outputs(records, output_dir)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        for site in args.sites:
+            print(f"\n=== p_c-forced training @ layer {layer} / {site} ===")
+            summary = run_pyvene_das(
+                rows=rows,
+                output_dir=output_dir / f"L{layer:02d}_{site}",
+                model_name=args.model_name,
+                target_var="pc",
+                layer=layer,
+                rank=args.rank,
+                site=site,
+                steps=args.steps,
+                batch_size=args.batch_size,
+                eval_batch_size=args.eval_batch_size,
+                learning_rate=args.learning_rate,
+                seed=args.seed,
+                eval_interval=args.eval_interval,
+                train_control_types=["all"],
+                export_rotation_weight=True,
+                model=model,
+                tokenizer=tokenizer,
+                eval_train=False,
+            )
+            records.append(cell_record(layer, site, summary))
+            write_outputs(records, output_dir)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print_table(records)
     print(f"\nWrote {len(records)} layers to {output_dir / 'pc_forced_sweep.csv'}")
@@ -132,6 +133,7 @@ def main() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sweep p_c-forced DAS training over layers.")
     parser.add_argument("--layers", type=int, nargs="+", default=[8, 11, 14, 17, 20, 23])
+    parser.add_argument("--sites", nargs="+", default=["claim_final"], choices=["claim_final", "answer_token"])
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--steps", type=int, default=750)
     parser.add_argument("--batch-size", type=int, default=32)

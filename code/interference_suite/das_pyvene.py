@@ -490,8 +490,9 @@ def make_stable_low_rank_intervention_type(pv: Any) -> Any:
 def register_pyvene_model_mappings(model: Any) -> None:
     """Register HF model classes missing from pyvene 0.1.x mappings.
 
-    pyvene 0.1.8 has Qwen2 mappings but not the HF Qwen3 classes. Qwen3 uses
-    the same decoder block paths for the block components used by these DAS runs.
+    pyvene 0.1.8 has Qwen2 mappings but not the HF Qwen3 classes, and no
+    Granite mappings. Both families keep the llama-style decoder block paths
+    (model.layers[N]) for the block components used by these DAS runs.
     """
 
     try:
@@ -505,11 +506,17 @@ def register_pyvene_model_mappings(model: Any) -> None:
 
     config_model_type = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
     class_name = model_type.__name__.lower()
-    if "qwen3" in f"{config_model_type}:{class_name}":
-        source_type = find_mapping_type(mu, "Qwen2ForCausalLM")
-        if source_type is not None:
-            mu.type_to_dimension_mapping[model_type] = dict(mu.type_to_dimension_mapping[source_type])
-            mu.type_to_module_mapping[model_type] = dict(mu.qwen2_lm_type_to_module_mapping)
+    tag = f"{config_model_type}:{class_name}"
+    if "qwen3" in tag:
+        source_name = "Qwen2ForCausalLM"
+    elif "granite" in tag:
+        source_name = "LlamaForCausalLM"
+    else:
+        return
+    source_type = find_mapping_type(mu, source_name)
+    if source_type is not None:
+        mu.type_to_dimension_mapping[model_type] = dict(mu.type_to_dimension_mapping[source_type])
+        mu.type_to_module_mapping[model_type] = dict(mu.type_to_module_mapping[source_type])
 
 
 def find_mapping_type(modeling_utils: Any, class_name: str) -> Any | None:
