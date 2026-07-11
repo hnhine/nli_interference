@@ -94,6 +94,7 @@ def cell_record(layer: int, site: str, summary: dict) -> dict:
         "site": site,
         "test_IIA": test.get("IIA"),
         "main_IIA": control_iia("main"),
+        "distractor_IIA": control_iia("distractor"),
         "gate_m0_IIA": control_iia("gate_m0"),
         "label_copy_trap_IIA": control_iia("label_copy_trap"),
         "global_top_in_TFU_rate": test.get("global_top_in_TFU_rate"),

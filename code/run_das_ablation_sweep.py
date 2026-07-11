@@ -29,7 +29,14 @@ from pathlib import Path
 from interference_suite.das_pyvene import import_runtime, load_hf_model, to_jsonable
 from interference_suite.io_utils import read_rows_csv
 from interference_suite.model import DEFAULT_CACHE_DIR, resolve_label_tokens
-from run_das_ablation import CONDITION_NAMES, ablate_one, get_decoder_layers, print_ablation_table
+from run_das_ablation import (
+    CONDITION_NAMES,
+    ablate_one,
+    build_donor_indices,
+    get_decoder_layers,
+    print_ablation_table,
+    resolve_condition_column,
+)
 
 
 def main() -> int:
@@ -40,6 +47,8 @@ def main() -> int:
     rng.shuffle(rows)
     if not rows:
         raise ValueError("No rows matched filters")
+    condition_on = resolve_condition_column(args.target_var, args.condition_on)
+    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(rows, condition_on, args.seed)
 
     torch, _, amc, atc = import_runtime()
     tokenizer, model = load_hf_model(torch=torch, auto_model_cls=amc, auto_tokenizer_cls=atc,
@@ -55,22 +64,27 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
     for rdir in args.rotation_dirs:
-        print(f"\n=========== ablate {rdir} ===========")
-        summary, all_scored = ablate_one(model, layers, tokenizer, torch, device, hidden, rows,
-                                         rdir, label_tokens.token_ids, args.eval_batch_size, args.seed)
-        print_ablation_table(summary, all_scored)
-        (output_dir / f"{Path(rdir).name}.json").write_text(json.dumps(to_jsonable(summary), indent=2))
+        name = Path(rdir).name
+        cell_json = output_dir / f"{name}.json"
+        cached = json.loads(cell_json.read_text()) if cell_json.exists() else None
+        cache_complete = cached is not None and (
+            donor_indices is None or "das_resample_opposite" in cached
+        )
+        if cache_complete:
+            print(f"\n=========== skip {name}: da co ket qua, doc lai tu {cell_json.name} ===========")
+            summary = cached
+        elif not (Path(rdir) / "rotation_weight_metadata.json").exists():
+            print(f"\n=========== SKIP {name}: chua co rotation (train chua xong?) ===========")
+            continue
+        else:
+            print(f"\n=========== ablate {rdir} ===========")
+            summary, all_scored = ablate_one(model, layers, tokenizer, torch, device, hidden, rows,
+                                             rdir, label_tokens.token_ids, args.eval_batch_size, args.seed,
+                                             donor_indices=donor_indices, condition_on=condition_on)
+            print_ablation_table(summary, all_scored)
+            cell_json.write_text(json.dumps(to_jsonable(summary), indent=2))
 
-        def acc(cond, ctrl):
-            return (summary[cond]["by_control"].get(ctrl) or {}).get("accuracy")
-        rec = {"cell": Path(rdir).name, "layer": summary["layer"], "site": summary["site"]}
-        for ctrl in ("main", "gate_m0"):
-            rec[f"{ctrl}_none"] = acc("none", ctrl)
-            rec[f"{ctrl}_das_resample"] = acc("das_resample", ctrl)
-            rec[f"{ctrl}_rand_resample"] = acc("rand_resample", ctrl)
-        if rec["main_none"] is not None:
-            rec["necessity_excess"] = rec["main_rand_resample"] - rec["main_das_resample"]
-        records.append(rec)
+        records.append(build_record(name, summary))
         with (output_dir / "ablation_sweep.csv").open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(records[0].keys())); w.writeheader(); w.writerows(records)
 
@@ -84,6 +98,32 @@ def main() -> int:
     return 0
 
 
+def build_record(name: str, summary: dict) -> dict:
+    def acc(cond, ctrl):
+        return (summary[cond]["by_control"].get(ctrl) or {}).get("accuracy")
+
+    rec = {
+        "cell": name,
+        "layer": summary["layer"],
+        "site": summary["site"],
+        "rank": summary.get("rank"),
+        "condition_on": summary.get("condition_on"),
+    }
+    for ctrl in ("main", "gate_m0"):
+        rec[f"{ctrl}_none"] = acc("none", ctrl)
+        rec[f"{ctrl}_das_resample"] = acc("das_resample", ctrl)
+        if "das_resample_same" in summary:
+            rec[f"{ctrl}_das_resample_same"] = acc("das_resample_same", ctrl)
+            rec[f"{ctrl}_das_resample_opposite"] = acc("das_resample_opposite", ctrl)
+        rec[f"{ctrl}_rand_resample"] = acc("rand_resample", ctrl)
+    if rec["main_none"] is not None:
+        rec["necessity_excess"] = rec["main_rand_resample"] - rec["main_das_resample"]
+        if "main_das_resample_same" in rec:
+            rec["purity_drop"] = rec["main_none"] - rec["main_das_resample_same"]
+            rec["backup_rescue"] = rec["main_das_resample_opposite"]
+    return rec
+
+
 def fmt(v):
     return f"{v:.4f}" if isinstance(v, (int, float)) else "   -  "
 
@@ -94,6 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--samples", required=True)
     p.add_argument("--model-name", required=True)
     p.add_argument("--target-var", default="pc")
+    p.add_argument("--condition-on", default="auto",
+                   help="Column defining same/opposite donor classes; auto maps pc/pi/m to p_c_base/p_i_base/m_base.")
+    p.add_argument("--skip-conditioned-donors", action="store_true",
+                   help="Run only the legacy zero/random-resample conditions.")
     p.add_argument("--split", default="test", choices=["train", "val", "test", "all"])
     p.add_argument("--eval-batch-size", type=int, default=64)
     p.add_argument("--label-token-style", default="auto")

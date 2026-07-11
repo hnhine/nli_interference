@@ -9,6 +9,12 @@ Corruption modes (applied only to the R-subspace at the intervention site):
   zero     : h <- h - (R^T h) R          (project the subspace out)
   resample : h <- h - (R^T h)R + (R^T h')R, h' = a random other example
              (in-distribution values, destroys THIS row's p_c; the honest mode)
+  resample_same:
+             h' has the same target-variable value, preferably from a different
+             event; tests whether the subspace also carries nuisance content
+  resample_opposite:
+             h' has the opposite target-variable value; directly tests whether
+             downstream computation follows that value or a backup path
 
 Subspaces:
   das    : the trained rotation (necessity of the found direction)
@@ -62,9 +68,10 @@ def make_rotation(kind: str, saved: Any, hidden: int, rank: int, torch: Any, dev
     return R.to(device=device, dtype=torch.float32)
 
 
-def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, device, label_ids, batch_size, rng):
+def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, device, label_ids,
+                  batch_size, rng, donor_z=None):
     """Return scored rows for one (subspace, mode) condition, or mode='none'."""
-    hook_state: dict[str, Any] = {"positions": None, "R": R, "mode": mode}
+    hook_state: dict[str, Any] = {"positions": None, "R": R, "mode": mode, "donor_z": None}
 
     def hook(module, inputs, output):
         if hook_state["positions"] is None or hook_state["mode"] == "none":
@@ -78,6 +85,8 @@ def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, d
         proj = z @ Rmat.T                                # [B,H]
         if hook_state["mode"] == "zero":
             new = h - proj
+        elif hook_state["mode"] in ("resample_same", "resample_opposite"):
+            new = h - proj + hook_state["donor_z"].to(hs.device) @ Rmat.T
         else:  # resample: donor = permuted rows within batch
             perm = torch.randperm(h.shape[0], device=hs.device)
             donor = (z[perm] @ Rmat.T)
@@ -91,14 +100,21 @@ def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, d
     scored: list[dict[str, Any]] = []
     try:
         batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
+        offset = 0
         for batch_rows in progress_iter(batches, total=len(batches), desc=f"{mode}"):
             texts = [str(r["base_prompt"]) for r in batch_rows]
             enc = encode_to_device(tokenizer, texts, device)
             positions = torch.tensor(
-                [resolve_token_site(tokenizer, t, r, "base", site) for t, r in zip(texts, batch_rows)],
+                [
+                    resolve_token_site(tokenizer, t, r, "base", site if site != "row" else str(r["base_site"]))
+                    for t, r in zip(texts, batch_rows)
+                ],
                 dtype=torch.long, device=device,
             )
             hook_state["positions"] = positions
+            if donor_z is not None:
+                hook_state["donor_z"] = donor_z[offset : offset + len(batch_rows)]
+            offset += len(batch_rows)
             with torch.no_grad():
                 logits = model(**enc).logits
             final_idx = enc["attention_mask"].sum(dim=1) - 1
@@ -116,7 +132,78 @@ def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, d
     finally:
         handle.remove()
         hook_state["positions"] = None
+        hook_state["donor_z"] = None
     return scored
+
+
+def collect_subspace_coordinates(model, layer, site, R, rows, tokenizer, torch, device, batch_size):
+    """Collect natural-run z=hR in row order for conditioned donor resampling."""
+    zs = []
+    batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
+    for batch_rows in progress_iter(batches, total=len(batches), desc="collect z"):
+        texts = [str(r["base_prompt"]) for r in batch_rows]
+        enc = encode_to_device(tokenizer, texts, device)
+        positions = torch.tensor(
+            [
+                resolve_token_site(tokenizer, t, r, "base", site if site != "row" else str(r["base_site"]))
+                for t, r in zip(texts, batch_rows)
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        with torch.no_grad():
+            hs = model(**enc, output_hidden_states=True, use_cache=False).hidden_states[layer + 1]
+        b = torch.arange(hs.shape[0], device=hs.device)
+        zs.append((hs[b, positions].to(torch.float32) @ R).cpu())
+    return torch.cat(zs, dim=0)
+
+
+def resolve_condition_column(target_var: str, condition_on: str) -> str:
+    """Resolve the row column whose value defines same/opposite donor classes."""
+    if condition_on != "auto":
+        return condition_on
+    return {"pc": "p_c_base", "pi": "p_i_base", "m": "m_base"}.get(target_var, "base_label")
+
+
+def build_donor_indices(rows: list[dict[str, Any]], condition_on: str, seed: int) -> dict[str, list[int]]:
+    """Build fixed same/opposite donor mappings, matched within control type."""
+    rng = random.Random(seed)
+    by_control: dict[str, dict[str, list[int]]] = {}
+    for i, row in enumerate(rows):
+        if condition_on not in row or str(row[condition_on]) == "":
+            raise ValueError(f"Missing donor condition column {condition_on!r} on row {i}")
+        ctrl = str(row.get("control_type", ""))
+        lab = str(row[condition_on])
+        by_control.setdefault(ctrl, {}).setdefault(lab, []).append(i)
+
+    same = [-1] * len(rows)
+    opposite = [-1] * len(rows)
+    for ctrl, pools in by_control.items():
+        classes = sorted(pools)
+        if len(classes) != 2:
+            raise ValueError(
+                f"Condition {condition_on!r} must have exactly two classes within control "
+                f"{ctrl!r}; found {classes}"
+            )
+        other = {classes[0]: classes[1], classes[1]: classes[0]}
+        for lab, indices in pools.items():
+            for i in indices:
+                event = str(rows[i].get("base_event_id", ""))
+                same_candidates = [
+                    j for j in indices if j != i and str(rows[j].get("base_event_id", "")) != event
+                ]
+                if not same_candidates:
+                    same_candidates = [j for j in indices if j != i]
+                if not same_candidates:
+                    raise ValueError(f"No non-self same-class donor for row {i} ({ctrl=}, {lab=})")
+                opp_candidates = [
+                    j for j in pools[other[lab]] if str(rows[j].get("base_event_id", "")) != event
+                ]
+                if not opp_candidates:
+                    opp_candidates = pools[other[lab]]
+                same[i] = rng.choice(same_candidates)
+                opposite[i] = rng.choice(opp_candidates)
+    return {"same": same, "opposite": opposite}
 
 
 def summarize(scored: list[dict[str, Any]]) -> dict[str, Any]:
@@ -131,11 +218,15 @@ def summarize(scored: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-CONDITION_NAMES = ["none", "das_zero", "das_resample", "rand_zero", "rand_resample"]
+CONDITION_NAMES = [
+    "none", "das_zero", "das_resample", "das_resample_same",
+    "das_resample_opposite", "rand_zero", "rand_resample",
+]
 
 
-def ablate_one(model, layers, tokenizer, torch, device, hidden, rows, rotation_dir, label_ids, batch_size, seed):
-    """Run all 5 ablation conditions for one trained rotation. Returns (summary, all_scored)."""
+def ablate_one(model, layers, tokenizer, torch, device, hidden, rows, rotation_dir, label_ids,
+               batch_size, seed, donor_indices=None, condition_on=None):
+    """Run unified necessity conditions for one trained rotation."""
     import numpy as np
 
     meta = json.loads((Path(rotation_dir) / "rotation_weight_metadata.json").read_text())
@@ -148,15 +239,27 @@ def ablate_one(model, layers, tokenizer, torch, device, hidden, rows, rotation_d
     R_das = make_rotation("das", saved, hidden, rank, torch, device, None)
     torch.manual_seed(seed)
     R_rand = make_rotation("random", saved, hidden, rank, torch, device, None)
-    conditions = [("none", None), ("zero", R_das), ("resample", R_das), ("zero", R_rand), ("resample", R_rand)]
+    conditions = [("none", None, None), ("zero", R_das, None), ("resample", R_das, None)]
+    if donor_indices is not None:
+        z = collect_subspace_coordinates(model, layer, site, R_das, rows, tokenizer, torch, device, batch_size)
+        conditions.extend([
+            ("resample_same", R_das, z[donor_indices["same"]]),
+            ("resample_opposite", R_das, z[donor_indices["opposite"]]),
+        ])
+    conditions.extend([("zero", R_rand, None), ("resample", R_rand, None)])
 
     rng = random.Random(seed)
     summary: dict[str, Any] = {"layer": layer, "rank": rank, "site": site}
+    if condition_on is not None:
+        summary["condition_on"] = condition_on
     all_scored: dict[str, Any] = {}
-    for (mode, R), name in zip(conditions, CONDITION_NAMES):
+    names = CONDITION_NAMES if donor_indices is not None else [
+        "none", "das_zero", "das_resample", "rand_zero", "rand_resample"
+    ]
+    for (mode, R, donor_z), name in zip(conditions, names):
         print(f"  --- {name} (L{layer}/{site}) ---")
         scored = run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, device,
-                               label_ids, batch_size, rng)
+                               label_ids, batch_size, rng, donor_z=donor_z)
         summary[name] = summarize(scored)
         all_scored[name] = scored
     return summary, all_scored
@@ -166,15 +269,19 @@ def print_ablation_table(summary, all_scored):
     controls = sorted({r["control_type"] for r in all_scored["none"]})
     hdr = f"{'condition':16s} {'overall':>8s} " + " ".join(f"{c:>16s}" for c in controls)
     print(hdr); print("-" * len(hdr))
-    for name in CONDITION_NAMES:
+    for name in (n for n in CONDITION_NAMES if n in summary):
         s = summary[name]
         cells = " ".join(f"{s['by_control'][c]['accuracy']:>16.4f}" for c in controls)
         print(f"{name:16s} {s['accuracy']:>8.4f} {cells}")
-    def macc(name): return summary[name]["by_control"].get("main", {}).get("accuracy")
+    def macc(name):
+        return (summary.get(name) or {}).get("by_control", {}).get("main", {}).get("accuracy")
     if macc("none") is not None:
         print(f"main drop DAS resample={macc('none')-macc('das_resample'):+.4f}"
               f" random resample={macc('none')-macc('rand_resample'):+.4f}"
               f" excess(necessity)={macc('rand_resample')-macc('das_resample'):+.4f}")
+        if macc("das_resample_same") is not None:
+            print(f"main purity_drop={macc('none')-macc('das_resample_same'):+.4f}"
+                  f" backup_rescue={macc('das_resample_opposite'):.4f}")
 
 
 def main() -> int:
@@ -185,6 +292,8 @@ def main() -> int:
     rng.shuffle(rows)  # global shuffle so within-batch resample donors are random
     if not rows:
         raise ValueError("No rows matched filters")
+    condition_on = resolve_condition_column(args.target_var, args.condition_on)
+    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(rows, condition_on, args.seed)
 
     torch, _, amc, atc = import_runtime()
     tokenizer, model = load_hf_model(torch=torch, auto_model_cls=amc, auto_tokenizer_cls=atc,
@@ -197,7 +306,8 @@ def main() -> int:
     hidden = model.config.hidden_size
 
     summary, all_scored = ablate_one(model, layers, tokenizer, torch, device, hidden, rows,
-                                     args.rotation_dir, label_tokens.token_ids, args.eval_batch_size, args.seed)
+                                     args.rotation_dir, label_tokens.token_ids, args.eval_batch_size, args.seed,
+                                     donor_indices=donor_indices, condition_on=condition_on)
     summary["model"] = args.model_name
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +325,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rotation-dir", required=True)
     p.add_argument("--model-name", required=True)
     p.add_argument("--target-var", default="pc")
+    p.add_argument("--condition-on", default="auto",
+                   help="Column defining same/opposite donor classes; auto maps pc/pi/m to p_c_base/p_i_base/m_base.")
+    p.add_argument("--skip-conditioned-donors", action="store_true",
+                   help="Run only the legacy zero/random-resample conditions.")
     p.add_argument("--split", default="test", choices=["train", "val", "test", "all"])
     p.add_argument("--eval-batch-size", type=int, default=64)
     p.add_argument("--label-token-style", default="auto")

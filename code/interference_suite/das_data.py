@@ -268,6 +268,33 @@ def generate_pi_pairs(
             )
 
             no_match_base = make_example(claim_event, matched_idx, m_i=0, p_i=p_i_base, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
+            no_match_polarities = replace_tuple(no_match_base.assumption_polarities, matched_idx, p_i_src)
+            no_match_source = make_example(
+                claim_event,
+                matched_idx,
+                m_i=0,
+                p_i=p_i_src,
+                p_c=p_c,
+                rng=rng,
+                assumption_events=no_match_base.assumption_events,
+                assumption_polarities=no_match_polarities,
+            )
+            rows.append(
+                make_pair_row(
+                    sample_id=sample_id("pi", base_id, matched_idx, p_i_base, p_c, "gate"),
+                    base_id=base_id,
+                    split=split,
+                    target_var="pi",
+                    control_type="gate_m0",
+                    base=no_match_base,
+                    source=no_match_source,
+                    target_label="U",
+                    base_site=f"a{matched_idx + 1}_final",
+                    source_site=f"a{matched_idx + 1}_final",
+                    extra={"p_i_src": no_match_source.p_i, "p_c_src": no_match_source.p_c, "m_src": no_match_source.m_i},
+                )
+            )
+
             label_copy_source = make_example(claim_event, matched_idx, m_i=1, p_i=p_i_src, p_c=p_c, rng=rng, excluded_keys=excluded_keys)
             rows.append(
                 make_pair_row(
