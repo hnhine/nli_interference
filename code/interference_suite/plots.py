@@ -104,7 +104,96 @@ def plot_exp3(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:
     sns.heatmap(heat, annot=True, fmt=".2f", cmap="vlag", center=0)
     plt.title("Exp 3: mean R by match position")
     paths.append(save_current(output_dir / "exp3_position_heatmap.png", plt))
+
+    pairs = build_exp3_pair_effects(exp)
+    if not pairs.empty:
+        effect_palette = {"Target flip": "#4C78A8", "Distractor flip": "#F58518"}
+        plt.figure(figsize=(7.2, 4.6))
+        ax = sns.barplot(
+            data=pairs,
+            x="match_idx",
+            y="abs_delta_R",
+            hue="pair_label",
+            hue_order=["Target flip", "Distractor flip"],
+            errorbar="se",
+            capsize=0.08,
+            palette=effect_palette,
+        )
+        ax.set_title("Exp 3: target vs distractor flip effect")
+        ax.set_xlabel("Target position")
+        ax.set_ylabel(r"Mean $|\Delta R|$")
+        ax.legend(title="")
+        for container in ax.containers:
+            ax.bar_label(container, fmt="%.2f", padding=3, fontsize=8)
+        max_effect = pairs.groupby(["match_idx", "pair_label"])["abs_delta_R"].mean().max()
+        ax.set_ylim(0, float(max_effect) * 1.2)
+        paths.append(save_current(output_dir / "exp3_flip_effects_by_position.png", plt))
+
+        success_order = ["Target flip", "Distractor flip"]
+        success = (
+            pairs.groupby("pair_label", as_index=False)["pair_success"]
+            .mean()
+            .set_index("pair_label")
+            .reindex(success_order)
+            .reset_index()
+        )
+        plt.figure(figsize=(6.2, 4.2))
+        ax = plt.gca()
+        bars = ax.bar(
+            success["pair_label"],
+            success["pair_success"],
+            color=[effect_palette[label] for label in success["pair_label"]],
+        )
+        ax.set_ylim(0, 1.04)
+        ax.set_xlabel("")
+        ax.set_ylabel("Rate")
+        ax.set_title("Exp 3: directional accuracy / prediction invariance")
+        ax.bar_label(bars, labels=[f"{value:.1%}" for value in success["pair_success"]], padding=3)
+        paths.append(save_current(output_dir / "exp3_flip_success_rates.png", plt))
     return paths
+
+
+def build_exp3_pair_effects(exp: pd.DataFrame) -> pd.DataFrame:
+    required = {
+        "base_event_id",
+        "match_idx",
+        "match_polarity",
+        "exp3_distractor_config",
+        "R",
+        "pred_label",
+    }
+    if not required.issubset(exp.columns):
+        return pd.DataFrame()
+    core = exp[exp["exp3_distractor_config"].notna()].copy()
+    if core.empty:
+        return pd.DataFrame()
+
+    target_keys = ["base_event_id", "match_idx", "exp3_distractor_config"]
+    positive = core[core["match_polarity"] == "positive"][
+        target_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_positive", "pred_label": "pred_positive"})
+    negative = core[core["match_polarity"] == "negative"][
+        target_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_negative", "pred_label": "pred_negative"})
+    target = positive.merge(negative, on=target_keys, how="inner", validate="one_to_one")
+    target["abs_delta_R"] = (target["R_positive"] - target["R_negative"]).abs()
+    target["pair_success"] = target["R_positive"] > target["R_negative"]
+    target["pair_label"] = "Target flip"
+
+    distractor_keys = ["base_event_id", "match_idx", "match_polarity"]
+    anchor = core[core["exp3_distractor_config"] == "anchor"][
+        distractor_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_anchor", "pred_label": "pred_anchor"})
+    flips = core[core["exp3_distractor_config"] != "anchor"][
+        distractor_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_flipped", "pred_label": "pred_flipped"})
+    distractor = flips.merge(anchor, on=distractor_keys, how="inner", validate="many_to_one")
+    distractor["abs_delta_R"] = (distractor["R_flipped"] - distractor["R_anchor"]).abs()
+    distractor["pair_success"] = distractor["pred_flipped"] == distractor["pred_anchor"]
+    distractor["pair_label"] = "Distractor flip"
+
+    columns = ["base_event_id", "match_idx", "abs_delta_R", "pair_success", "pair_label"]
+    return pd.concat([target[columns], distractor[columns]], ignore_index=True)
 
 
 def plot_exp4(df: pd.DataFrame, output_dir: Path, plt, sns) -> list[Path]:

@@ -1,0 +1,261 @@
+"""Plot M-v4 DAS profiles across normalized depth for Qwen and Phi-4.
+
+The figure separates the two transition directions (Active*) from both
+anti-label-copy controls.  Colors follow the original dark-to-light model
+palettes and claim-final/answer-token sites are shown in separate panels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    csv_path: Path
+    num_layers: int
+    colors: dict[str, str]
+
+
+METRIC_STYLES = {
+    "active": {"label": "Active*", "linewidth": 2.8},
+    "macro": {"label": "Macro", "linewidth": 2.2},
+    "anti_copy": {"label": r"Label-copy trap ($0\to1$)", "linewidth": 1.9},
+    "same_m1": {"label": r"Identity control ($1\to1$)", "linewidth": 1.6},
+}
+PLOT_ORDER = ("same_m1", "anti_copy", "macro", "active")
+SITES = ("claim_final", "answer_token")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Plot Qwen and Phi-4 M-v4 IIA against normalized depth."
+    )
+    parser.add_argument(
+        "--qwen-csv",
+        type=Path,
+        default=Path("data/das/qwen_m_v4_r16_stride2_1ep_b32/relay_map.csv"),
+    )
+    parser.add_argument(
+        "--phi4-csv",
+        type=Path,
+        default=Path("data/das/phi4_m_v4_r64_stride2/relay_map.csv"),
+    )
+    parser.add_argument("--qwen-layers", type=int, default=36)
+    parser.add_argument("--phi4-layers", type=int, default=32)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/das/m_v4_normalized_depth_qwen_phi4.png"),
+    )
+    parser.add_argument(
+        "--normalized-csv",
+        type=Path,
+        default=Path("data/das/m_v4_normalized_depth_qwen_phi4.csv"),
+    )
+    parser.add_argument("--dpi", type=int, default=320)
+    return parser.parse_args()
+
+
+def required_float(row: dict[str, str], key: str) -> float:
+    value = row.get(key, "").strip()
+    if not value:
+        raise ValueError(f"Missing {key!r} at layer={row.get('layer')} site={row.get('site')}")
+    return float(value)
+
+
+def load_model(spec: ModelSpec) -> list[dict[str, float | int | str]]:
+    with spec.csv_path.open(newline="", encoding="utf-8") as handle:
+        raw_rows = list(csv.DictReader(handle))
+
+    rows: list[dict[str, float | int | str]] = []
+    for raw in raw_rows:
+        site = raw.get("site", "")
+        if site not in SITES:
+            continue
+        match_to_nomatch = required_float(raw, "match_to_nomatch_IIA")
+        nomatch_to_match = required_float(raw, "nomatch_to_match_IIA")
+        anti_copy = required_float(raw, "label_copy_trap_IIA")
+        same_m1 = required_float(raw, "label_copy_trap_same_m1_IIA")
+        active = mean((match_to_nomatch, nomatch_to_match))
+        macro = mean((match_to_nomatch, nomatch_to_match, anti_copy, same_m1))
+
+        recorded_core = required_float(raw, "m_core_IIA")
+        recorded_macro = required_float(raw, "test_IIA")
+        if abs(recorded_core - active) > 1e-9:
+            raise ValueError(
+                f"m_core_IIA={recorded_core} disagrees with active={active} "
+                f"at layer={raw.get('layer')} site={site}"
+            )
+        if abs(recorded_macro - macro) > 1e-9:
+            raise ValueError(
+                f"test_IIA={recorded_macro} disagrees with macro={macro} "
+                f"at layer={raw.get('layer')} site={site}"
+            )
+
+        layer = int(raw["layer"])
+        rows.append(
+            {
+                "model": spec.name,
+                "num_layers": spec.num_layers,
+                "layer": layer,
+                "normalized_depth": layer / spec.num_layers,
+                "site": site,
+                "active": active,
+                "macro": macro,
+                "anti_copy": anti_copy,
+                "same_m1": same_m1,
+                "match_to_nomatch": match_to_nomatch,
+                "nomatch_to_match": nomatch_to_match,
+            }
+        )
+
+    if not rows:
+        raise ValueError(f"No claim_final/answer_token rows found in {spec.csv_path}")
+    return sorted(rows, key=lambda row: (str(row["site"]), int(row["layer"])))
+
+
+def write_normalized_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "model",
+        "num_layers",
+        "layer",
+        "normalized_depth",
+        "site",
+        "active",
+        "macro",
+        "anti_copy",
+        "same_m1",
+        "match_to_nomatch",
+        "nomatch_to_match",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot(models: list[tuple[ModelSpec, list[dict]]], output: Path, dpi: int) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import PercentFormatter
+
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.titlesize": 13,
+            "axes.labelsize": 12,
+            "legend.fontsize": 9.2,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 7.0), sharex=True, sharey=True)
+    site_titles = {
+        "claim_final": "Claim-final intervention site",
+        "answer_token": "Answer-token intervention site",
+    }
+
+    for ax, site in zip(axes, SITES):
+        for spec, rows in models:
+            site_rows = [row for row in rows if row["site"] == site]
+            x = [float(row["normalized_depth"]) for row in site_rows]
+            for metric in PLOT_ORDER:
+                style = METRIC_STYLES[metric]
+                y = [float(row[metric]) for row in site_rows]
+                ax.plot(
+                    x,
+                    y,
+                    color=spec.colors[metric],
+                    linestyle="-",
+                    linewidth=style["linewidth"],
+                    alpha=0.97,
+                )
+
+        ax.set_title(site_titles[site])
+        ax.set_xlabel("Normalized depth (layer / number of layers)")
+        ax.set_xlim(-0.015, 1.0)
+        ax.set_ylim(-0.02, 1.03)
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+        ax.grid(True, which="major", color="#D9D9D9", linewidth=0.8, alpha=0.75)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    axes[0].set_ylabel("Interchange Intervention Accuracy (IIA)")
+    fig.suptitle(r"Event–claim match ($m$) across normalized model depth", fontsize=16)
+
+    legend_handles = []
+    for spec, _ in models:
+        for metric in ("active", "macro", "anti_copy", "same_m1"):
+            style = METRIC_STYLES[metric]
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=spec.colors[metric],
+                    linestyle="-",
+                    linewidth=style["linewidth"],
+                    label=f"{spec.name} - {style['label']}",
+                )
+            )
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=2,
+        frameon=False,
+        columnspacing=2.8,
+    )
+    fig.tight_layout(rect=(0, 0.17, 1, 0.96))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=dpi, bbox_inches="tight", facecolor="white")
+    fig.savefig(output.with_suffix(".pdf"), bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def main() -> int:
+    args = parse_args()
+    specs = [
+        ModelSpec(
+            "Qwen3-8B",
+            args.qwen_csv,
+            args.qwen_layers,
+            {
+                "active": "#E85D04",
+                "macro": "#F3A261",
+                "anti_copy": "#F6B77C",
+                "same_m1": "#FAD7B5",
+            },
+        ),
+        ModelSpec(
+            "Phi-4 Mini Instruct",
+            args.phi4_csv,
+            args.phi4_layers,
+            {
+                "active": "#1D4ED8",
+                "macro": "#7AA7E8",
+                "anti_copy": "#9CC2EC",
+                "same_m1": "#C7DCF7",
+            },
+        ),
+    ]
+    model_rows = [(spec, load_model(spec)) for spec in specs]
+    all_rows = [row for _, rows in model_rows for row in rows]
+    write_normalized_csv(all_rows, args.normalized_csv)
+    plot(model_rows, args.output, args.dpi)
+    print(f"Wrote {args.output}")
+    print(f"Wrote {args.output.with_suffix('.pdf')}")
+    print(f"Wrote {args.normalized_csv}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

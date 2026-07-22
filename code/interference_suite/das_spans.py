@@ -74,11 +74,31 @@ def resolve_token_site(tokenizer: Any, text: str, row: dict[str, Any], prefix: s
 
     if site == "answer_token":
         return last_non_whitespace_token(tokenizer, text)
+    if site == "row_lexical_final":
+        row_site = str(row[f"{prefix}_site"])
+        if row_site == "matched_assumption_final":
+            row_site = "matched_assumption_lexical_final"
+        elif row_site.startswith("a") and row_site.endswith("_final"):
+            row_site = f"{row_site.removesuffix('_final')}_lexical_final"
+        else:
+            raise ValueError(f"Cannot lexicalize row site: {row_site}")
+        return resolve_token_site(tokenizer, text, row, prefix, row_site)
     if site == "claim_final":
         return last_token_in_named_span(tokenizer, text, row, prefix, "claim")
     if site == "matched_assumption_final":
         matched_idx = int(row["matched_idx"])
         return last_token_in_named_span(tokenizer, text, row, prefix, f"a{matched_idx + 1}")
+    if site == "matched_assumption_lexical_final":
+        matched_idx = int(row["matched_idx"])
+        return last_lexical_token_in_named_span(tokenizer, text, row, prefix, f"a{matched_idx + 1}")
+    if site.startswith("a") and site.endswith("_lexical_final"):
+        return last_lexical_token_in_named_span(
+            tokenizer,
+            text,
+            row,
+            prefix,
+            site.removesuffix("_lexical_final"),
+        )
     if site.startswith("a") and site.endswith("_final"):
         return last_token_in_named_span(tokenizer, text, row, prefix, site.removesuffix("_final"))
     raise ValueError(f"Unknown DAS token site: {site}")
@@ -90,6 +110,31 @@ def last_token_in_named_span(tokenizer: Any, text: str, row: dict[str, Any], pre
     if start_key not in row or end_key not in row:
         raise ValueError(f"Missing span columns for {prefix}:{span_name}")
     return last_non_whitespace_token_in_char_span(
+        tokenizer,
+        text,
+        (int(row[start_key]), int(row[end_key])),
+    )
+
+
+def last_lexical_token_in_named_span(
+    tokenizer: Any,
+    text: str,
+    row: dict[str, Any],
+    prefix: str,
+    span_name: str,
+) -> int:
+    """Return the token containing the span's final alphanumeric character.
+
+    This deliberately skips trailing punctuation. Some tokenizers merge a
+    sentence-final period with following newlines, so the ordinary final site
+    can resolve to a boundary token instead of the final lexical token.
+    """
+
+    start_key = f"{prefix}_{span_name}_span_start"
+    end_key = f"{prefix}_{span_name}_span_end"
+    if start_key not in row or end_key not in row:
+        raise ValueError(f"Missing span columns for {prefix}:{span_name}")
+    return last_lexical_token_in_char_span(
         tokenizer,
         text,
         (int(row[start_key]), int(row[end_key])),
@@ -123,6 +168,34 @@ def last_non_whitespace_token_in_char_span(tokenizer: Any, text: str, char_span:
     if hits:
         return hits[-1]
     return fallback_last_token_by_prefix(tokenizer, text, start, end)
+
+
+def last_lexical_token_in_char_span(tokenizer: Any, text: str, char_span: tuple[int, int]) -> int:
+    start, end = char_span
+    if start >= end:
+        raise ValueError(f"Empty char span: {char_span}")
+
+    lexical_end = end
+    while lexical_end > start and not text[lexical_end - 1].isalnum():
+        lexical_end -= 1
+    if lexical_end <= start:
+        raise ValueError(f"No alphanumeric character in char span {char_span}")
+    lexical_char = lexical_end - 1
+
+    try:
+        encoded = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
+        offsets = encoded["offset_mapping"]
+    except Exception:
+        return fallback_last_token_by_prefix(tokenizer, text, start, lexical_end)
+
+    hits = [
+        idx
+        for idx, (tok_start, tok_end) in enumerate(offsets)
+        if tok_start != tok_end and tok_start <= lexical_char < tok_end
+    ]
+    if hits:
+        return hits[-1]
+    return fallback_last_token_by_prefix(tokenizer, text, start, lexical_end)
 
 
 def fallback_last_token_by_prefix(tokenizer: Any, text: str, start: int, end: int) -> int:

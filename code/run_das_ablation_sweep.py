@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -34,8 +35,12 @@ from run_das_ablation import (
     ablate_one,
     build_donor_indices,
     get_decoder_layers,
+    make_donor_spec,
     print_ablation_table,
     resolve_condition_column,
+    resolve_condition_hold_columns,
+    resolve_donor_event_policy,
+    resolve_donor_pool,
 )
 
 
@@ -48,7 +53,24 @@ def main() -> int:
     if not rows:
         raise ValueError("No rows matched filters")
     condition_on = resolve_condition_column(args.target_var, args.condition_on)
-    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(rows, condition_on, args.seed)
+    condition_hold = resolve_condition_hold_columns(args.target_var, args.condition_hold)
+    if args.split == "all" and "split" not in condition_hold:
+        condition_hold.append("split")
+    donor_pool = resolve_donor_pool(args.target_var, args.donor_pool)
+    donor_event_policy = resolve_donor_event_policy(args.target_var, args.donor_event_policy)
+    donor_spec = make_donor_spec(condition_on, condition_hold, donor_pool, donor_event_policy)
+    donor_spec["seed"] = args.seed
+    donor_spec["row_signature"] = hashlib.sha256(
+        "\n".join(str(row.get("sample_id", "")) for row in rows).encode("utf-8")
+    ).hexdigest()[:16]
+    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(
+        rows,
+        condition_on,
+        args.seed,
+        condition_hold=condition_hold,
+        donor_pool=donor_pool,
+        donor_event_policy=donor_event_policy,
+    )
 
     torch, _, amc, atc = import_runtime()
     tokenizer, model = load_hf_model(torch=torch, auto_model_cls=amc, auto_tokenizer_cls=atc,
@@ -68,7 +90,8 @@ def main() -> int:
         cell_json = output_dir / f"{name}.json"
         cached = json.loads(cell_json.read_text()) if cell_json.exists() else None
         cache_complete = cached is not None and (
-            donor_indices is None or "das_resample_opposite" in cached
+            donor_indices is None
+            or ("das_resample_opposite" in cached and cached.get("donor_spec") == donor_spec)
         )
         if cache_complete:
             print(f"\n=========== skip {name}: da co ket qua, doc lai tu {cell_json.name} ===========")
@@ -80,7 +103,8 @@ def main() -> int:
             print(f"\n=========== ablate {rdir} ===========")
             summary, all_scored = ablate_one(model, layers, tokenizer, torch, device, hidden, rows,
                                              rdir, label_tokens.token_ids, args.eval_batch_size, args.seed,
-                                             donor_indices=donor_indices, condition_on=condition_on)
+                                             donor_indices=donor_indices, condition_on=condition_on,
+                                             donor_spec=None if donor_indices is None else donor_spec)
             print_ablation_table(summary, all_scored)
             cell_json.write_text(json.dumps(to_jsonable(summary), indent=2))
 
@@ -88,39 +112,66 @@ def main() -> int:
         with (output_dir / "ablation_sweep.csv").open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(records[0].keys())); w.writeheader(); w.writerows(records)
 
-    print("\n============  NECESSITY ALONG THE RELAY (main accuracy)  ============")
-    hdr = f"{'cell':22s} {'none':>7s} {'das_res':>8s} {'rand_res':>9s} {'necessity':>10s} {'gate_das':>9s}"
-    print(hdr); print("-" * len(hdr))
-    for r in records:
-        print(f"{r['cell']:22s} {fmt(r['main_none'])} {fmt(r['main_das_resample'])} "
-              f"{fmt(r['main_rand_resample']):>9s} {fmt(r.get('necessity_excess')):>10s} {fmt(r['gate_m0_das_resample']):>9s}")
+    if args.target_var == "m":
+        print("\n============  NECESSITY FOR m BY DIRECTION  ============")
+        hdr = (f"{'cell':22s} {'control':19s} {'none':>7s} {'das_res':>8s} {'rand_res':>9s} "
+               f"{'necessity':>10s} {'same':>7s} {'opp_cf':>7s}")
+        print(hdr); print("-" * len(hdr))
+        for r in records:
+            for ctrl in ("match_to_nomatch", "nomatch_to_match", "label_copy_trap"):
+                print(
+                    f"{r['cell']:22s} {ctrl:19s} {fmt(r.get(f'{ctrl}_none'))} "
+                    f"{fmt(r.get(f'{ctrl}_das_resample'))} {fmt(r.get(f'{ctrl}_rand_resample')):>9s} "
+                    f"{fmt(r.get(f'necessity_excess_{ctrl}')):>10s} "
+                    f"{fmt(r.get(f'{ctrl}_das_resample_same'))} "
+                    f"{fmt(r.get(f'{ctrl}_das_resample_opposite_cf'))}"
+                )
+    else:
+        print("\n============  NECESSITY ALONG THE RELAY (main accuracy)  ============")
+        hdr = f"{'cell':22s} {'none':>7s} {'das_res':>8s} {'rand_res':>9s} {'necessity':>10s} {'gate_das':>9s}"
+        print(hdr); print("-" * len(hdr))
+        for r in records:
+            print(f"{r['cell']:22s} {fmt(r.get('main_none'))} {fmt(r.get('main_das_resample'))} "
+                  f"{fmt(r.get('main_rand_resample')):>9s} {fmt(r.get('necessity_excess')):>10s} "
+                  f"{fmt(r.get('gate_m0_das_resample')):>9s}")
     print(f"\nWrote {output_dir / 'ablation_sweep.csv'}")
     return 0
 
 
 def build_record(name: str, summary: dict) -> dict:
-    def acc(cond, ctrl):
-        return (summary[cond]["by_control"].get(ctrl) or {}).get("accuracy")
-
     rec = {
         "cell": name,
         "layer": summary["layer"],
         "site": summary["site"],
         "rank": summary.get("rank"),
         "condition_on": summary.get("condition_on"),
+        "condition_hold": ",".join(summary.get("condition_hold", [])),
+        "donor_pool": summary.get("donor_pool"),
+        "donor_event_policy": summary.get("donor_event_policy"),
     }
-    for ctrl in ("main", "gate_m0"):
-        rec[f"{ctrl}_none"] = acc("none", ctrl)
-        rec[f"{ctrl}_das_resample"] = acc("das_resample", ctrl)
-        if "das_resample_same" in summary:
-            rec[f"{ctrl}_das_resample_same"] = acc("das_resample_same", ctrl)
-            rec[f"{ctrl}_das_resample_opposite"] = acc("das_resample_opposite", ctrl)
-        rec[f"{ctrl}_rand_resample"] = acc("rand_resample", ctrl)
-    if rec["main_none"] is not None:
-        rec["necessity_excess"] = rec["main_rand_resample"] - rec["main_das_resample"]
-        if "main_das_resample_same" in rec:
-            rec["purity_drop"] = rec["main_none"] - rec["main_das_resample_same"]
-            rec["backup_rescue"] = rec["main_das_resample_opposite"]
+    controls = sorted(summary["none"].get("by_control", {}))
+    for ctrl in controls:
+        for cond in CONDITION_NAMES:
+            stats = (summary.get(cond) or {}).get("by_control", {}).get(ctrl)
+            if not stats:
+                continue
+            rec[f"{ctrl}_{cond}"] = stats.get("accuracy")
+            rec[f"{ctrl}_{cond}_cf"] = stats.get("counterfactual_accuracy")
+            rec[f"{ctrl}_{cond}_U_rate"] = (stats.get("pred_dist") or {}).get("U")
+        none = rec.get(f"{ctrl}_none")
+        das = rec.get(f"{ctrl}_das_resample")
+        rand = rec.get(f"{ctrl}_rand_resample")
+        same = rec.get(f"{ctrl}_das_resample_same")
+        if das is not None and rand is not None:
+            rec[f"necessity_excess_{ctrl}"] = rand - das
+        if none is not None and same is not None:
+            rec[f"purity_drop_{ctrl}"] = none - same
+
+    # Stable legacy aliases used by existing pc/pi analysis notebooks.
+    if rec.get("main_none") is not None:
+        rec["necessity_excess"] = rec.get("necessity_excess_main")
+        rec["purity_drop"] = rec.get("purity_drop_main")
+        rec["backup_rescue"] = rec.get("main_das_resample_opposite")
     return rec
 
 
@@ -136,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-var", default="pc")
     p.add_argument("--condition-on", default="auto",
                    help="Column defining same/opposite donor classes; auto maps pc/pi/m to p_c_base/p_i_base/m_base.")
+    p.add_argument(
+        "--condition-hold",
+        default="auto",
+        help=("Comma-separated nuisance columns fixed for donors. Auto uses none for pc/pi and "
+              "p_i_base,p_c_base,mismatch_type,matched_idx for m."),
+    )
+    p.add_argument("--donor-pool", default="auto",
+                   choices=["auto", "within_control", "m_main", "all"])
+    p.add_argument("--donor-event-policy", default="auto",
+                   choices=["auto", "prefer", "require", "ignore"])
     p.add_argument("--skip-conditioned-donors", action="store_true",
                    help="Run only the legacy zero/random-resample conditions.")
     p.add_argument("--split", default="test", choices=["train", "val", "test", "all"])

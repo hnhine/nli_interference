@@ -41,6 +41,8 @@ def run_pyvene_das(
     save_intervention: bool = False,
     export_rotation_weight: bool = False,
     train_control_types: list[str] | None = None,
+    train_control_proportions: dict[str, float] | None = None,
+    include_relaxed: bool = False,
     model: Any | None = None,
     tokenizer: Any | None = None,
     eval_train: bool = True,
@@ -54,12 +56,24 @@ def run_pyvene_das(
     if not target_rows:
         raise ValueError(f"No DAS rows found for target_var={target_var!r}")
 
+    n_relaxed_excluded = 0
+    if not include_relaxed:
+        n_target_all = len(target_rows)
+        target_rows = drop_relaxed_rows(target_rows)
+        n_relaxed_excluded = n_target_all - len(target_rows)
+        if not target_rows:
+            raise ValueError(
+                f"All {n_target_all} rows for target_var={target_var!r} are mismatch_exclusion_relaxed; "
+                "pass include_relaxed=True to use them"
+            )
+
     all_train_rows = rows_for_split(target_rows, "train")
     train_rows = filter_train_rows(all_train_rows, target_var, train_control_types)
     val_rows = rows_for_split(target_rows, "val") or all_train_rows
     test_rows = rows_for_split(target_rows, "test") or val_rows
     if not train_rows:
         raise ValueError(f"No train rows found for target_var={target_var!r}")
+    resolved_control_proportions = validate_control_proportions(train_rows, train_control_proportions)
 
     if model is None or tokenizer is None:
         tokenizer, model = load_hf_model(
@@ -93,7 +107,12 @@ def run_pyvene_das(
         unit="step",
     )
     for step in step_iter:
-        batch_rows = sample_with_replacement(train_rows, batch_size, rng)
+        batch_rows = sample_training_batch(
+            train_rows,
+            batch_size,
+            rng,
+            control_proportions=resolved_control_proportions,
+        )
         batch = collate_rows(
             rows=batch_rows,
             tokenizer=tokenizer,
@@ -147,6 +166,12 @@ def run_pyvene_das(
     test_metrics, test_scored = evaluate_pyvene_das(
         intervenable, test_rows, tokenizer, torch, input_device, label_tokens.token_ids, eval_batch_size, site, "Final test"
     )
+    # Headline metric over the interchange controls only, so trap/gate rows in
+    # the test split cannot inflate or dilute the reported IIA.
+    core_controls = set(resolved_train_control_types(target_var, None))
+    test_core_metrics = summarize_scored(
+        [row for row in test_scored if str(row.get("control_type")) in core_controls]
+    )
 
     write_rows_csv(val_scored, output_dir / "val_scored.csv")
     write_rows_csv(test_scored, output_dir / "test_scored.csv")
@@ -165,6 +190,7 @@ def run_pyvene_das(
                 "site": site,
                 "steps": steps,
                 "learning_rate": learning_rate,
+                "train_control_proportions": resolved_control_proportions,
             },
         )
     summary = {
@@ -183,11 +209,16 @@ def run_pyvene_das(
         "n_train": len(train_rows),
         "n_train_all": len(all_train_rows),
         "train_control_types": resolved_train_control_types(target_var, train_control_types),
+        "train_control_proportions": resolved_control_proportions,
+        "include_relaxed": include_relaxed,
+        "n_relaxed_excluded": n_relaxed_excluded,
         "n_val": len(val_rows),
         "n_test": len(test_rows),
         "train": train_metrics,
         "val": val_metrics,
         "test": test_metrics,
+        "test_core_controls": sorted(core_controls),
+        "test_core": test_core_metrics,
         "history": history,
     }
     (output_dir / "summary_metrics.json").write_text(json.dumps(to_jsonable(summary), indent=2), encoding="utf-8")
@@ -491,8 +522,10 @@ def register_pyvene_model_mappings(model: Any) -> None:
     """Register HF model classes missing from pyvene 0.1.x mappings.
 
     pyvene 0.1.8 has Qwen2 mappings but not the HF Qwen3 classes, and no
-    Granite mappings. Both families keep the llama-style decoder block paths
-    (model.layers[N]) for the block components used by these DAS runs.
+    Granite or Phi-3 mappings. These families keep the llama-style decoder
+    block paths (model.layers[N]) for the block components used by these DAS
+    runs. Phi-4-mini-instruct is implemented by Transformers as
+    Phi3ForCausalLM, so it uses the Phi-3 branch here.
     """
 
     try:
@@ -509,14 +542,33 @@ def register_pyvene_model_mappings(model: Any) -> None:
     tag = f"{config_model_type}:{class_name}"
     if "qwen3" in tag:
         source_name = "Qwen2ForCausalLM"
-    elif "granite" in tag:
+    elif "granite" in tag or "phi3" in tag:
         source_name = "LlamaForCausalLM"
+    elif "gemma4" in tag:
+        source_name = "Gemma2ForCausalLM"
     else:
         return
     source_type = find_mapping_type(mu, source_name)
     if source_type is not None:
-        mu.type_to_dimension_mapping[model_type] = dict(mu.type_to_dimension_mapping[source_type])
-        mu.type_to_module_mapping[model_type] = dict(mu.type_to_module_mapping[source_type])
+        dimension_mapping = dict(mu.type_to_dimension_mapping[source_type])
+        module_mapping = dict(mu.type_to_module_mapping[source_type])
+        if "gemma4" in tag:
+            outer_model = getattr(model, "model", None)
+            if hasattr(outer_model, "language_model"):
+                module_mapping = {
+                    component: (path.replace("model.", "model.language_model.", 1), *details)
+                    for component, (path, *details) in module_mapping.items()
+                }
+            if hasattr(getattr(model, "config", None), "text_config"):
+                dimension_mapping = {
+                    component: tuple(
+                        proposal if proposal.isnumeric() else f"text_config.{proposal}"
+                        for proposal in proposals
+                    )
+                    for component, proposals in dimension_mapping.items()
+                }
+        mu.type_to_dimension_mapping[model_type] = dimension_mapping
+        mu.type_to_module_mapping[model_type] = module_mapping
 
 
 def find_mapping_type(modeling_utils: Any, class_name: str) -> Any | None:
@@ -541,6 +593,19 @@ def rows_for_split(rows: list[dict[str, Any]], split: str) -> list[dict[str, Any
     return [row for row in rows if row.get("split") == split]
 
 
+def is_relaxed_row(row: dict[str, Any]) -> bool:
+    """True for m rows whose mismatch event relaxed the cross-split exclusion.
+
+    pc/pi rows lack the column entirely (empty string after CSV round-trip)
+    and are never treated as relaxed.
+    """
+    return str(row.get("mismatch_exclusion_relaxed", "0") or "0") == "1"
+
+
+def drop_relaxed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if not is_relaxed_row(row)]
+
+
 def filter_train_rows(rows: list[dict[str, Any]], target_var: str, train_control_types: list[str] | None) -> list[dict[str, Any]]:
     controls = resolved_train_control_types(target_var, train_control_types)
     if controls == ["all"]:
@@ -556,6 +621,8 @@ def resolved_train_control_types(target_var: str, train_control_types: list[str]
             return ["main"]
         if target_var == "m":
             return ["match_to_nomatch", "nomatch_to_match"]
+        if target_var == "rho":
+            return ["flip_pi", "flip_pc", "hold_both", "source_m0", "gate_m0", "label_copy_trap"]
     return values
 
 
@@ -648,6 +715,71 @@ def sample_with_replacement(rows: list[dict[str, Any]], batch_size: int, rng: ra
     return [rng.choice(rows) for _ in range(batch_size)]
 
 
+def validate_control_proportions(
+    rows: list[dict[str, Any]],
+    proportions: dict[str, float] | None,
+) -> dict[str, float] | None:
+    """Validate and normalize requested per-batch control proportions."""
+    if proportions is None:
+        return None
+    if not proportions:
+        raise ValueError("train_control_proportions must not be empty")
+    available = {str(row.get("control_type", "")) for row in rows}
+    unknown = sorted(set(proportions) - available)
+    if unknown:
+        raise ValueError(
+            f"train_control_proportions contains controls absent from the training pool: {unknown}; "
+            f"available={sorted(available)}"
+        )
+    invalid = {name: value for name, value in proportions.items() if float(value) <= 0}
+    if invalid:
+        raise ValueError(f"train_control_proportions values must be positive, got {invalid}")
+    total = sum(float(value) for value in proportions.values())
+    if total <= 0:
+        raise ValueError("train_control_proportions must have positive total weight")
+    return {str(name): float(value) / total for name, value in proportions.items()}
+
+
+def sample_training_batch(
+    rows: list[dict[str, Any]],
+    batch_size: int,
+    rng: random.Random,
+    *,
+    control_proportions: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Sample a normal or exactly stratified training batch.
+
+    Integer allocations use the largest-remainder rule. Choose a batch size
+    divisible by the requested fractions (e.g. 30 for 1/2,1/6,1/6,1/6) when
+    every step must have the exact same composition.
+    """
+    if control_proportions is None:
+        return sample_with_replacement(rows, batch_size, rng)
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        control = str(row.get("control_type", ""))
+        if control in control_proportions:
+            groups.setdefault(control, []).append(row)
+
+    raw_counts = {name: batch_size * weight for name, weight in control_proportions.items()}
+    counts = {name: int(value) for name, value in raw_counts.items()}
+    remaining = batch_size - sum(counts.values())
+    remainder_order = sorted(
+        control_proportions,
+        key=lambda name: (raw_counts[name] - counts[name], control_proportions[name], name),
+        reverse=True,
+    )
+    for name in remainder_order[:remaining]:
+        counts[name] += 1
+
+    batch: list[dict[str, Any]] = []
+    for name in control_proportions:
+        batch.extend(sample_with_replacement(groups[name], counts[name], rng))
+    rng.shuffle(batch)
+    return batch
+
+
 def chunks(rows: list[dict[str, Any]], batch_size: int) -> Iterable[list[dict[str, Any]]]:
     for start in range(0, len(rows), batch_size):
         yield rows[start : start + batch_size]
@@ -671,6 +803,34 @@ def summarize_scored(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 float(row["global_top_in_TFU"]) for row in control_rows if "global_top_in_TFU" in row
             ),
         }
+    by_pi_regime: dict[str, dict[str, Any]] = {}
+    pi_regimes = sorted({str(row.get("pi_regime", "")) for row in rows if str(row.get("pi_regime", ""))})
+    for regime in pi_regimes:
+        regime_rows = [row for row in rows if str(row.get("pi_regime", "")) == regime]
+        by_pi_regime[regime] = {
+            "n": len(regime_rows),
+            "IIA": mean(float(row["is_correct"]) for row in regime_rows),
+            "mean_R": mean(float(row["R"]) for row in regime_rows),
+            "mean_U_gap": mean(float(row["U_gap"]) for row in regime_rows),
+            "global_top_in_TFU_rate": mean(
+                float(row["global_top_in_TFU"]) for row in regime_rows if "global_top_in_TFU" in row
+            ),
+        }
+    pi_regime_macro_iia = mean(value["IIA"] for value in by_pi_regime.values())
+    by_rho_regime: dict[str, dict[str, Any]] = {}
+    rho_regimes = sorted({str(row.get("rho_regime", "")) for row in rows if str(row.get("rho_regime", ""))})
+    for regime in rho_regimes:
+        regime_rows = [row for row in rows if str(row.get("rho_regime", "")) == regime]
+        by_rho_regime[regime] = {
+            "n": len(regime_rows),
+            "IIA": mean(float(row["is_correct"]) for row in regime_rows),
+            "mean_R": mean(float(row["R"]) for row in regime_rows),
+            "mean_U_gap": mean(float(row["U_gap"]) for row in regime_rows),
+            "global_top_in_TFU_rate": mean(
+                float(row["global_top_in_TFU"]) for row in regime_rows if "global_top_in_TFU" in row
+            ),
+        }
+    rho_regime_macro_iia = mean(value["IIA"] for value in by_rho_regime.values())
     return {
         "n": len(rows),
         "IIA": mean(correct),
@@ -681,6 +841,10 @@ def summarize_scored(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "U_rate": pred_counts["U"] / len(rows),
         "global_top_in_TFU_rate": mean(float(row["global_top_in_TFU"]) for row in rows if "global_top_in_TFU" in row),
         "by_control": by_control,
+        "by_rho_regime": by_rho_regime,
+        "rho_regime_macro_IIA": rho_regime_macro_iia,
+        "by_pi_regime": by_pi_regime,
+        "pi_regime_macro_IIA": pi_regime_macro_iia,
     }
 
 

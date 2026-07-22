@@ -43,7 +43,7 @@ import json
 import random
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from interference_suite.das_pyvene import encode_to_device, import_runtime, load_hf_model, mean, to_jsonable
 from interference_suite.das_spans import resolve_token_site
@@ -66,6 +66,28 @@ def make_rotation(kind: str, saved: Any, hidden: int, rank: int, torch: Any, dev
         g = torch.randn(hidden, rank, dtype=torch.float32)
         R, _ = torch.linalg.qr(g)
     return R.to(device=device, dtype=torch.float32)
+
+
+SCORED_METADATA_COLUMNS = (
+    "base_event_id",
+    "target_var",
+    "split",
+    "mismatch_type",
+    "matched_idx",
+    "m_base",
+    "m_src",
+    "p_i_base",
+    "p_i_src",
+    "p_c_base",
+    "p_c_src",
+    "target_label",
+    "eval_side",
+    "base_mismatch_type",
+    "donor_mismatch_type",
+    "base_slot",
+    "donor_slot",
+    "matrix_m",
+)
 
 
 def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, device, label_ids,
@@ -123,12 +145,17 @@ def run_condition(model, layers, layer, site, R, mode, rows, tokenizer, torch, d
             for r, row_logits in zip(batch_rows, nl):
                 vals = {lab: float(row_logits[tid].detach().cpu()) for lab, tid in label_ids.items()}
                 pred = max(vals, key=vals.get)
-                scored.append({
+                target_label = r.get("target_label")
+                record = {
                     "sample_id": r.get("sample_id"), "control_type": r.get("control_type"),
                     "true_label": r.get("base_label"), "pred_label": pred,
                     "is_correct": int(pred == r.get("base_label")),
+                    "counterfactual_label": target_label,
+                    "is_counterfactual_correct": int(target_label not in (None, "") and pred == target_label),
                     "R": vals["T"] - vals["F"], "U_gap": vals["U"] - max(vals["T"], vals["F"]),
-                })
+                }
+                record.update({key: r.get(key) for key in SCORED_METADATA_COLUMNS if key in r})
+                scored.append(record)
     finally:
         handle.remove()
         hook_state["positions"] = None
@@ -165,54 +192,173 @@ def resolve_condition_column(target_var: str, condition_on: str) -> str:
     return {"pc": "p_c_base", "pi": "p_i_base", "m": "m_base"}.get(target_var, "base_label")
 
 
-def build_donor_indices(rows: list[dict[str, Any]], condition_on: str, seed: int) -> dict[str, list[int]]:
-    """Build fixed same/opposite donor mappings, matched within control type."""
+M_MAIN_CONTROLS = frozenset({"match_to_nomatch", "nomatch_to_match"})
+
+
+def parse_column_list(value: str | Sequence[str] | None) -> list[str]:
+    """Parse comma-separated/repeated donor hold columns, preserving order."""
+    if value is None:
+        return []
+    raw = [value] if isinstance(value, str) else list(value)
+    out: list[str] = []
+    for item in raw:
+        for column in str(item).split(","):
+            column = column.strip()
+            if column and column.lower() != "none" and column not in out:
+                out.append(column)
+    return out
+
+
+def resolve_condition_hold_columns(target_var: str, condition_hold: str | Sequence[str] | None) -> list[str]:
+    """Resolve nuisance columns that must stay fixed while the donor class flips."""
+    if condition_hold == "auto" or condition_hold == ["auto"]:
+        if target_var == "m":
+            return ["p_i_base", "p_c_base", "mismatch_type", "matched_idx"]
+        return []
+    return parse_column_list(condition_hold)
+
+
+def resolve_donor_pool(target_var: str, donor_pool: str) -> str:
+    if donor_pool == "auto":
+        return "m_main" if target_var == "m" else "within_control"
+    return donor_pool
+
+
+def resolve_donor_event_policy(target_var: str, donor_event_policy: str) -> str:
+    if donor_event_policy == "auto":
+        return "require" if target_var == "m" else "prefer"
+    return donor_event_policy
+
+
+def make_donor_spec(condition_on: str, condition_hold: Sequence[str], donor_pool: str,
+                    donor_event_policy: str) -> dict[str, Any]:
+    return {
+        "condition_on": condition_on,
+        "condition_hold": list(condition_hold),
+        "donor_pool": donor_pool,
+        "donor_event_policy": donor_event_policy,
+        "candidate_controls": sorted(M_MAIN_CONTROLS) if donor_pool == "m_main" else None,
+    }
+
+
+def build_donor_indices(
+    rows: list[dict[str, Any]],
+    condition_on: str,
+    seed: int,
+    *,
+    condition_hold: str | Sequence[str] | None = None,
+    donor_pool: str = "within_control",
+    donor_event_policy: str = "prefer",
+) -> dict[str, list[int]]:
+    """Build fixed same/opposite donor mappings.
+
+    ``condition_on`` is the binary variable to preserve/flip. Every
+    ``condition_hold`` column is fixed. Legacy pc/pi behavior uses
+    ``donor_pool='within_control'``. For m, ``m_main`` pools candidates across
+    the two causal directions because each direction contains only one base-m
+    class; label-copy rows remain recipients but never become donors.
+    """
+    hold_columns = parse_column_list(condition_hold)
+    if donor_pool not in {"within_control", "m_main", "all"}:
+        raise ValueError(f"Unknown donor_pool {donor_pool!r}")
+    if donor_event_policy not in {"prefer", "require", "ignore"}:
+        raise ValueError(f"Unknown donor_event_policy {donor_event_policy!r}")
+
     rng = random.Random(seed)
-    by_control: dict[str, dict[str, list[int]]] = {}
+
+    def row_value(
+        row: dict[str, Any], column: str, index: int, *, allow_missing: bool = False
+    ) -> str | None:
+        value = row.get(column, "")
+        if str(value) == "":
+            if allow_missing:
+                return None
+            raise ValueError(f"Missing donor column {column!r} on row {index}")
+        return str(value)
+
+    def pool_key(row: dict[str, Any]) -> str:
+        if donor_pool == "within_control":
+            return str(row.get("control_type", ""))
+        return donor_pool
+
+    # (pool, held nuisance values) -> condition class -> candidate row indices
+    candidate_pools: dict[tuple[str, tuple[str, ...]], dict[str, list[int]]] = {}
     for i, row in enumerate(rows):
-        if condition_on not in row or str(row[condition_on]) == "":
-            raise ValueError(f"Missing donor condition column {condition_on!r} on row {i}")
-        ctrl = str(row.get("control_type", ""))
-        lab = str(row[condition_on])
-        by_control.setdefault(ctrl, {}).setdefault(lab, []).append(i)
+        # M-v4 contains an evaluation-only same-m=1 trap without a physical
+        # mismatch event. It is a recipient but never a donor under m_main, so
+        # skip non-main candidates before requiring mismatch metadata.
+        if donor_pool == "m_main" and str(row.get("control_type", "")) not in M_MAIN_CONTROLS:
+            continue
+        lab = row_value(row, condition_on, i)
+        held = tuple(row_value(row, column, i) for column in hold_columns)
+        candidate_pools.setdefault((pool_key(row), held), {}).setdefault(lab, []).append(i)
 
     same = [-1] * len(rows)
     opposite = [-1] * len(rows)
-    for ctrl, pools in by_control.items():
+    for i, row in enumerate(rows):
+        lab = row_value(row, condition_on, i)
+        held = tuple(
+            row_value(row, column, i, allow_missing=True) for column in hold_columns
+        )
+        stratum = (pool_key(row), held)
+        if any(value is None for value in held):
+            # A missing nuisance value means that nuisance is inapplicable to
+            # this recipient, not that all nuisance matching should be dropped.
+            # Pool exact donor strata only across the missing dimensions.
+            pools: dict[str, list[int]] = {}
+            for (candidate_pool, candidate_held), candidate_classes in candidate_pools.items():
+                if candidate_pool != stratum[0]:
+                    continue
+                if not all(
+                    recipient is None or recipient == candidate
+                    for recipient, candidate in zip(held, candidate_held)
+                ):
+                    continue
+                for candidate_class, indices in candidate_classes.items():
+                    pools.setdefault(candidate_class, []).extend(indices)
+        else:
+            pools = candidate_pools.get(stratum, {})
         classes = sorted(pools)
         if len(classes) != 2:
             raise ValueError(
-                f"Condition {condition_on!r} must have exactly two classes within control "
-                f"{ctrl!r}; found {classes}"
+                f"Condition {condition_on!r} must have exactly two donor classes in "
+                f"stratum pool={stratum[0]!r}, holds={dict(zip(hold_columns, held))}; found {classes}"
             )
-        other = {classes[0]: classes[1], classes[1]: classes[0]}
-        for lab, indices in pools.items():
-            for i in indices:
-                event = str(rows[i].get("base_event_id", ""))
-                same_candidates = [
-                    j for j in indices if j != i and str(rows[j].get("base_event_id", "")) != event
-                ]
-                if not same_candidates:
-                    same_candidates = [j for j in indices if j != i]
-                if not same_candidates:
-                    raise ValueError(f"No non-self same-class donor for row {i} ({ctrl=}, {lab=})")
-                opp_candidates = [
-                    j for j in pools[other[lab]] if str(rows[j].get("base_event_id", "")) != event
-                ]
-                if not opp_candidates:
-                    opp_candidates = pools[other[lab]]
-                same[i] = rng.choice(same_candidates)
-                opposite[i] = rng.choice(opp_candidates)
+        if lab not in pools:
+            raise ValueError(f"Recipient class {lab!r} has no candidate pool in stratum {stratum!r}")
+        other = classes[1] if lab == classes[0] else classes[0]
+
+        def candidates(indices: Sequence[int], kind: str) -> list[int]:
+            nonself = [j for j in indices if j != i]
+            if not nonself:
+                raise ValueError(f"No non-self {kind} donor for row {i} in stratum {stratum!r}")
+            if donor_event_policy == "ignore":
+                return nonself
+            event = str(row.get("base_event_id", ""))
+            different = [j for j in nonself if str(rows[j].get("base_event_id", "")) != event]
+            if different:
+                return different
+            if donor_event_policy == "require":
+                raise ValueError(f"No different-event {kind} donor for row {i} in stratum {stratum!r}")
+            return nonself
+
+        same[i] = rng.choice(candidates(pools[lab], "same-class"))
+        opposite[i] = rng.choice(candidates(pools[other], "opposite-class"))
     return {"same": same, "opposite": opposite}
 
 
 def summarize(scored: list[dict[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {"n": len(scored), "accuracy": mean(float(r["is_correct"]) for r in scored)}
+    out: dict[str, Any] = {
+        "n": len(scored),
+        "accuracy": mean(float(r["is_correct"]) for r in scored),
+        "counterfactual_accuracy": mean(float(r["is_counterfactual_correct"]) for r in scored),
+    }
     by: dict[str, Any] = {}
     for c in sorted({r["control_type"] for r in scored}):
         cr = [r for r in scored if r["control_type"] == c]
         preds = {lab: sum(r["pred_label"] == lab for r in cr) / len(cr) for lab in ("T", "F", "U")}
         by[c] = {"n": len(cr), "accuracy": mean(float(r["is_correct"]) for r in cr),
+                 "counterfactual_accuracy": mean(float(r["is_counterfactual_correct"]) for r in cr),
                  "mean_R": mean(float(r["R"]) for r in cr), "pred_dist": preds}
     out["by_control"] = by
     return out
@@ -225,7 +371,7 @@ CONDITION_NAMES = [
 
 
 def ablate_one(model, layers, tokenizer, torch, device, hidden, rows, rotation_dir, label_ids,
-               batch_size, seed, donor_indices=None, condition_on=None):
+               batch_size, seed, donor_indices=None, condition_on=None, donor_spec=None):
     """Run unified necessity conditions for one trained rotation."""
     import numpy as np
 
@@ -252,6 +398,11 @@ def ablate_one(model, layers, tokenizer, torch, device, hidden, rows, rotation_d
     summary: dict[str, Any] = {"layer": layer, "rank": rank, "site": site}
     if condition_on is not None:
         summary["condition_on"] = condition_on
+    if donor_spec is not None:
+        summary["donor_spec"] = donor_spec
+        summary["condition_hold"] = donor_spec.get("condition_hold", [])
+        summary["donor_pool"] = donor_spec.get("donor_pool")
+        summary["donor_event_policy"] = donor_spec.get("donor_event_policy")
     all_scored: dict[str, Any] = {}
     names = CONDITION_NAMES if donor_indices is not None else [
         "none", "das_zero", "das_resample", "rand_zero", "rand_resample"
@@ -282,6 +433,17 @@ def print_ablation_table(summary, all_scored):
         if macc("das_resample_same") is not None:
             print(f"main purity_drop={macc('none')-macc('das_resample_same'):+.4f}"
                   f" backup_rescue={macc('das_resample_opposite'):.4f}")
+    elif "das_resample_opposite" in summary:
+        print("\nconditioned donor diagnostics by control:")
+        for ctrl in controls:
+            base = summary["none"]["by_control"][ctrl]["accuracy"]
+            same = summary["das_resample_same"]["by_control"][ctrl]["accuracy"]
+            opposite = summary["das_resample_opposite"]["by_control"][ctrl]
+            print(
+                f"  {ctrl:18s} same_ret={same:.4f} purity_drop={base-same:+.4f} "
+                f"opp_orig={opposite['accuracy']:.4f} opp_cf={opposite['counterfactual_accuracy']:.4f} "
+                f"opp_U={opposite['pred_dist']['U']:.4f}"
+            )
 
 
 def main() -> int:
@@ -293,7 +455,21 @@ def main() -> int:
     if not rows:
         raise ValueError("No rows matched filters")
     condition_on = resolve_condition_column(args.target_var, args.condition_on)
-    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(rows, condition_on, args.seed)
+    condition_hold = resolve_condition_hold_columns(args.target_var, args.condition_hold)
+    if args.split == "all" and "split" not in condition_hold:
+        condition_hold.append("split")
+    donor_pool = resolve_donor_pool(args.target_var, args.donor_pool)
+    donor_event_policy = resolve_donor_event_policy(args.target_var, args.donor_event_policy)
+    donor_spec = make_donor_spec(condition_on, condition_hold, donor_pool, donor_event_policy)
+    donor_spec["seed"] = args.seed
+    donor_indices = None if args.skip_conditioned_donors else build_donor_indices(
+        rows,
+        condition_on,
+        args.seed,
+        condition_hold=condition_hold,
+        donor_pool=donor_pool,
+        donor_event_policy=donor_event_policy,
+    )
 
     torch, _, amc, atc = import_runtime()
     tokenizer, model = load_hf_model(torch=torch, auto_model_cls=amc, auto_tokenizer_cls=atc,
@@ -307,7 +483,8 @@ def main() -> int:
 
     summary, all_scored = ablate_one(model, layers, tokenizer, torch, device, hidden, rows,
                                      args.rotation_dir, label_tokens.token_ids, args.eval_batch_size, args.seed,
-                                     donor_indices=donor_indices, condition_on=condition_on)
+                                     donor_indices=donor_indices, condition_on=condition_on,
+                                     donor_spec=None if donor_indices is None else donor_spec)
     summary["model"] = args.model_name
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +504,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-var", default="pc")
     p.add_argument("--condition-on", default="auto",
                    help="Column defining same/opposite donor classes; auto maps pc/pi/m to p_c_base/p_i_base/m_base.")
+    p.add_argument(
+        "--condition-hold",
+        default="auto",
+        help=("Comma-separated nuisance columns fixed for same/opposite donors. "
+              "auto uses none for pc/pi and p_i_base,p_c_base,mismatch_type,matched_idx for m."),
+    )
+    p.add_argument(
+        "--donor-pool",
+        default="auto",
+        choices=["auto", "within_control", "m_main", "all"],
+        help="Candidate pooling; auto keeps pc/pi within-control and pools m across its two main directions.",
+    )
+    p.add_argument(
+        "--donor-event-policy",
+        default="auto",
+        choices=["auto", "prefer", "require", "ignore"],
+        help="Whether conditioned donors should come from a different base event; auto requires this for m.",
+    )
     p.add_argument("--skip-conditioned-donors", action="store_true",
                    help="Run only the legacy zero/random-resample conditions.")
     p.add_argument("--split", default="test", choices=["train", "val", "test", "all"])

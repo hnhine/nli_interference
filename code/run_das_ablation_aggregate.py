@@ -45,6 +45,9 @@ def main() -> int:
                 "site": summary.get("site"),
                 "rank": summary.get("rank"),
                 "condition_on": summary.get("condition_on"),
+                "condition_hold": ",".join(summary.get("condition_hold", [])),
+                "donor_pool": summary.get("donor_pool"),
+                "donor_event_policy": summary.get("donor_event_policy"),
             }
             controls = sorted(summary["none"].get("by_control", {}))
             for cond in CONDITIONS:
@@ -57,23 +60,35 @@ def main() -> int:
                         continue
                     key = f"{cond}.{ctrl}"
                     rec[f"{key}.acc"] = round(stats["accuracy"], 4)
+                    if stats.get("counterfactual_accuracy") is not None:
+                        rec[f"{key}.cf_acc"] = round(stats["counterfactual_accuracy"], 4)
                     rec[f"{key}.mean_R"] = round(stats["mean_R"], 3)
                     rec[f"{key}.U_rate"] = round(stats["pred_dist"].get("U", 0.0), 4)
-            # derived deltas on main
-            for cond in (
-                "das_zero",
-                "das_resample",
-                "das_resample_same",
-                "das_resample_opposite",
-                "rand_resample",
-            ):
-                a = rec.get(f"{cond}.main.acc")
-                b = rec.get("none.main.acc")
-                r_c, r_n = rec.get(f"{cond}.main.mean_R"), rec.get("none.main.mean_R")
-                if a is not None and b is not None:
-                    rec[f"delta_acc.main.{cond}"] = round(b - a, 4)
-                if r_c is not None and r_n is not None:
-                    rec[f"delta_meanR.main.{cond}"] = round(r_n - r_c, 3)
+            # Derived deltas for every control (legacy main fields remain unchanged).
+            for ctrl in controls:
+                for cond in (
+                    "das_zero",
+                    "das_resample",
+                    "das_resample_same",
+                    "das_resample_opposite",
+                    "rand_resample",
+                ):
+                    a = rec.get(f"{cond}.{ctrl}.acc")
+                    b = rec.get(f"none.{ctrl}.acc")
+                    r_c = rec.get(f"{cond}.{ctrl}.mean_R")
+                    r_n = rec.get(f"none.{ctrl}.mean_R")
+                    if a is not None and b is not None:
+                        rec[f"delta_acc.{ctrl}.{cond}"] = round(b - a, 4)
+                    if r_c is not None and r_n is not None:
+                        rec[f"delta_meanR.{ctrl}.{cond}"] = round(r_n - r_c, 3)
+                das = rec.get(f"das_resample.{ctrl}.acc")
+                rand = rec.get(f"rand_resample.{ctrl}.acc")
+                same = rec.get(f"das_resample_same.{ctrl}.acc")
+                baseline_ctrl = rec.get(f"none.{ctrl}.acc")
+                if das is not None and rand is not None:
+                    rec[f"necessity_excess.{ctrl}"] = round(rand - das, 4)
+                if same is not None and baseline_ctrl is not None:
+                    rec[f"purity_drop.{ctrl}"] = round(baseline_ctrl - same, 4)
             same = rec.get("das_resample_same.main.acc")
             opposite = rec.get("das_resample_opposite.main.acc")
             baseline = rec.get("none.main.acc")

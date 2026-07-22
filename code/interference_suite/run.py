@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .das_data import DAS_TARGETS, generate_das_pairs
+from .das_data import DAS_TARGETS, DEFAULT_DAS_TARGETS, M_VARIANTS, PC_VARIANTS, PI_VARIANTS, generate_das_pairs
 from .das_pyvene import run_pyvene_das
 from .generation import EXPERIMENTS, generate_exp6, generate_suite, generate_supplements, supplemental_sections_for_experiments
 from .hidden_dump import dump_das_hidden_states
@@ -123,12 +123,19 @@ def main(argv: list[str] | None = None) -> int:
                 save_intervention=args.save_intervention,
                 export_rotation_weight=args.export_rotation_weight,
                 train_control_types=args.train_control_types,
+                include_relaxed=args.include_relaxed,
             )
         except ImportError as exc:
             print(f"DAS dependency error: {exc}")
             return 2
         print(f"Wrote DAS outputs to {output_dir}")
-        print(f"Test IIA: {summary['test']['IIA']}")
+        if summary.get("n_relaxed_excluded"):
+            print(f"Excluded {summary['n_relaxed_excluded']} mismatch_exclusion_relaxed rows (pass --include-relaxed to keep them)")
+        print(f"Test IIA (all controls): {summary['test']['IIA']}")
+        core_controls = "+".join(summary.get("test_core_controls", []))
+        print(f"Test IIA (core {core_controls}): {(summary.get('test_core') or {}).get('IIA')}")
+        for control, stats in (summary["test"].get("by_control") or {}).items():
+            print(f"  test {control}: IIA={stats.get('IIA')} n={stats.get('n')}")
         return 0
 
 
@@ -218,13 +225,17 @@ def build_exp6_rows_from_args(args: argparse.Namespace) -> list[dict[str, object
 def build_das_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
     targets = args.targets
     if targets == ["all"]:
-        targets = list(DAS_TARGETS)
+        targets = list(DEFAULT_DAS_TARGETS)
     return generate_das_pairs(
         n_base_events=args.n_base_events,
         seed=args.seed,
         targets=targets,
         train_fraction=args.train_fraction,
         val_fraction=args.val_fraction,
+        m_verb_policy=args.m_verb_policy,
+        pc_variant=args.pc_variant,
+        pi_variant=args.pi_variant,
+        m_variant=args.m_variant,
     )
 
 
@@ -300,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     exp6_summarize.add_argument("--output-dir", default="data/exp6/summary")
     exp6_summarize.add_argument("--plots", action="store_true")
 
-    das_generate = subparsers.add_parser("das-generate", help="Generate base/source DAS pairs for pc, pi, and m interventions.")
+    das_generate = subparsers.add_parser("das-generate", help="Generate base/source DAS pairs for pc, pi, m, and rho interventions.")
     add_das_generation_args(das_generate)
     das_generate.add_argument("--jsonl", action="store_true", help="Also write JSONL output.")
 
@@ -311,7 +322,12 @@ def build_parser() -> argparse.ArgumentParser:
     das_run.add_argument("--layer", type=int, required=True)
     das_run.add_argument("--rank", type=int, default=None, help="DAS rank. Defaults to 1 for pc/pi and 8 for m.")
     das_run.add_argument("--component", default="block_output")
-    das_run.add_argument("--site", default="row", help="Use row-specific sites, or override with claim_final, answer_token, a1_final, etc.")
+    das_run.add_argument(
+        "--site",
+        default="row",
+        help=("Use row-specific sites, row_lexical_final for row-aware lexical sites, "
+              "or override with claim_final, answer_token, a1_final, etc."),
+    )
     das_run.add_argument("--steps", type=int, default=1000)
     das_run.add_argument("--eval-batch-size", type=int, default=None)
     das_run.add_argument("--learning-rate", type=float, default=1e-3)
@@ -326,6 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=["auto"],
         help="Control types used for training. auto uses main for pc/pi and both m directions for m; use all to train every row.",
     )
+    das_run.add_argument(
+        "--include-relaxed",
+        action="store_true",
+        help="Keep rows flagged mismatch_exclusion_relaxed=1 (excluded by default to avoid cross-split event leakage).",
+    )
     add_model_args(das_run)
 
 
@@ -335,7 +356,12 @@ def build_parser() -> argparse.ArgumentParser:
     das_hidden.add_argument("--target-var", required=True, choices=DAS_TARGETS)
     das_hidden.add_argument("--layer", type=int, required=True)
     das_hidden.add_argument("--component", default="block_output", choices=["block_input", "block_output"], help="Raw output_hidden_states component to dump.")
-    das_hidden.add_argument("--site", default="row", help="Use row-specific sites, or override with claim_final, answer_token, a1_final, etc.")
+    das_hidden.add_argument(
+        "--site",
+        default="row",
+        help=("Use row-specific sites, row_lexical_final for row-aware lexical sites, "
+              "or override with claim_final, answer_token, a1_final, etc."),
+    )
     das_hidden.add_argument("--split", default="val", choices=["all", "train", "val", "test"])
     das_hidden.add_argument("--control-types", nargs="+", default=["all"], help="Control types to dump, e.g. main gate_m0 label_copy_trap; use all for no filter.")
     das_hidden.add_argument("--limit", type=int, default=16, help="Dump only the first N matching rows; use -1 for all rows.")
@@ -379,6 +405,36 @@ def add_das_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--targets", nargs="+", default=["all"], choices=["all", *DAS_TARGETS])
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--val-fraction", type=float, default=0.15)
+    parser.add_argument(
+        "--pc-variant",
+        default="legacy",
+        choices=PC_VARIANTS,
+        help=("pc pair design. legacy preserves the original main/gate/trap generator; "
+              "v4 adds raw-p_c identification constraints with balanced "
+              "main/flip_both/flip_pi/gate/trap conditions."),
+    )
+    parser.add_argument(
+        "--pi-variant",
+        default="legacy",
+        choices=PI_VARIANTS,
+        help=("pi pair design. legacy exactly preserves the previous generator; "
+              "v4 adds the missing m_base=1, m_source=0 stratum and audit metadata; "
+              "v5 adds flip_both and flip_pc probes that distinguish raw p_i from REL."),
+    )
+    parser.add_argument(
+        "--m-verb-policy",
+        default="legacy",
+        choices=["legacy", "independent_v1"],
+        help=("Verb-mismatch policy for target m. independent_v1 uses an expanded vocabulary "
+              "and a predefined cross-semantic-group compatibility map."),
+    )
+    parser.add_argument(
+        "--m-variant",
+        default="legacy",
+        choices=M_VARIANTS,
+        help=("m pair design. legacy exactly preserves the previous generator; "
+              "v4 adds an m_base=1, m_source=1 same-value label-copy trap."),
+    )
     parser.add_argument("--output-dir", default="data/das/generated")
     parser.add_argument("--csv-name", default="pairs.csv")
     parser.add_argument("--jsonl-name", default="pairs.jsonl")

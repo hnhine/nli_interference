@@ -156,11 +156,133 @@ def summarize_exp3(df: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
         by_idx = group.groupby("match_idx")["R"].mean()
         position_bias[str(polarity)] = nullable_float((by_idx - overall).abs().max())
 
-    return {
+    summary = {
         "match_following_acc": float(exp["sign_correct"].mean()),
         "position_bias": position_bias,
         "label_acc": nullable_float(exp["is_correct"].mean()),
         "n": int(len(exp)),
+    }
+    minimal_pairs = summarize_exp3_minimal_pairs(exp, output_dir)
+    if minimal_pairs:
+        summary["minimal_pairs"] = minimal_pairs
+    return summary
+
+
+def summarize_exp3_minimal_pairs(exp: pd.DataFrame, output_dir: Path) -> dict[str, Any]:
+    """Summarize exact target and distractor polarity flips in Exp3 v2 rows."""
+
+    required = {"exp3_distractor_config", "match_polarity", "R", "pred_label"}
+    if not required.issubset(exp.columns):
+        return {}
+    core = exp[exp["exp3_distractor_config"].notna()].copy()
+    if core.empty:
+        return {}
+
+    target_keys = ["base_event_id", "match_idx", "exp3_distractor_config"]
+    positive = core[core["match_polarity"] == "positive"][
+        target_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_positive", "pred_label": "pred_positive"})
+    negative = core[core["match_polarity"] == "negative"][
+        target_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_negative", "pred_label": "pred_negative"})
+    target_pairs = positive.merge(negative, on=target_keys, how="inner", validate="one_to_one")
+    target_pairs["pair_type"] = "target_flip"
+    target_pairs["delta_R"] = target_pairs["R_positive"] - target_pairs["R_negative"]
+    target_pairs["abs_delta_R"] = target_pairs["delta_R"].abs()
+    target_pairs["pair_success"] = target_pairs["delta_R"] > 0
+
+    distractor_keys = ["base_event_id", "match_idx", "match_polarity"]
+    anchor = core[core["exp3_distractor_config"] == "anchor"][
+        distractor_keys + ["R", "pred_label"]
+    ].rename(columns={"R": "R_anchor", "pred_label": "pred_anchor"})
+    flips = core[core["exp3_distractor_config"] != "anchor"][
+        distractor_keys
+        + [
+            "exp3_distractor_config",
+            "exp3_flipped_distractor_idx",
+            "R",
+            "pred_label",
+        ]
+    ].rename(columns={"R": "R_flipped", "pred_label": "pred_flipped"})
+    distractor_pairs = flips.merge(anchor, on=distractor_keys, how="inner", validate="many_to_one")
+    distractor_pairs["pair_type"] = "distractor_flip"
+    distractor_pairs["delta_R"] = distractor_pairs["R_flipped"] - distractor_pairs["R_anchor"]
+    distractor_pairs["abs_delta_R"] = distractor_pairs["delta_R"].abs()
+    distractor_pairs["pair_success"] = (
+        distractor_pairs["pred_flipped"] == distractor_pairs["pred_anchor"]
+    )
+
+    pair_rows: list[dict[str, Any]] = []
+    for _, row in target_pairs.iterrows():
+        pair_rows.append({
+            "pair_type": "target_flip",
+            "base_event_id": row["base_event_id"],
+            "match_idx": row["match_idx"],
+            "match_polarity": "",
+            "distractor_config": row["exp3_distractor_config"],
+            "flipped_distractor_idx": "",
+            "R_reference": row["R_negative"],
+            "R_intervention": row["R_positive"],
+            "delta_R": row["delta_R"],
+            "abs_delta_R": row["abs_delta_R"],
+            "pred_reference": row["pred_negative"],
+            "pred_intervention": row["pred_positive"],
+            "pair_success": row["pair_success"],
+        })
+    for _, row in distractor_pairs.iterrows():
+        pair_rows.append({
+            "pair_type": "distractor_flip",
+            "base_event_id": row["base_event_id"],
+            "match_idx": row["match_idx"],
+            "match_polarity": row["match_polarity"],
+            "distractor_config": row["exp3_distractor_config"],
+            "flipped_distractor_idx": row["exp3_flipped_distractor_idx"],
+            "R_reference": row["R_anchor"],
+            "R_intervention": row["R_flipped"],
+            "delta_R": row["delta_R"],
+            "abs_delta_R": row["abs_delta_R"],
+            "pred_reference": row["pred_anchor"],
+            "pred_intervention": row["pred_flipped"],
+            "pair_success": row["pair_success"],
+        })
+    pd.DataFrame(pair_rows).to_csv(output_dir / "exp3_intervention_pairs.csv", index=False)
+
+    target_abs = target_pairs["abs_delta_R"]
+    distractor_abs = distractor_pairs["abs_delta_R"]
+    target_mean = nullable_float(target_abs.mean())
+    distractor_mean = nullable_float(distractor_abs.mean())
+    ratio = None
+    if target_mean is not None and distractor_mean not in (None, 0.0):
+        ratio = target_mean / distractor_mean
+
+    by_position: dict[str, dict[str, float | int | None]] = {}
+    for match_idx in sorted(core["match_idx"].dropna().unique()):
+        target_at_idx = target_pairs[target_pairs["match_idx"] == match_idx]
+        distractor_at_idx = distractor_pairs[distractor_pairs["match_idx"] == match_idx]
+        by_position[str(int(match_idx))] = {
+            "target_mean_abs_delta_R": nullable_float(target_at_idx["abs_delta_R"].mean()),
+            "distractor_mean_abs_delta_R": nullable_float(distractor_at_idx["abs_delta_R"].mean()),
+            "n_target_pairs": int(len(target_at_idx)),
+            "n_distractor_pairs": int(len(distractor_at_idx)),
+        }
+
+    return {
+        "target_flip": {
+            "n_pairs": int(len(target_pairs)),
+            "mean_delta_R_positive_minus_negative": nullable_float(target_pairs["delta_R"].mean()),
+            "mean_abs_delta_R": target_mean,
+            "median_abs_delta_R": nullable_float(target_abs.median()),
+            "directional_rate": nullable_float(target_pairs["pair_success"].mean()),
+        },
+        "distractor_flip": {
+            "n_pairs": int(len(distractor_pairs)),
+            "mean_delta_R": nullable_float(distractor_pairs["delta_R"].mean()),
+            "mean_abs_delta_R": distractor_mean,
+            "median_abs_delta_R": nullable_float(distractor_abs.median()),
+            "prediction_invariance_rate": nullable_float(distractor_pairs["pair_success"].mean()),
+        },
+        "target_to_distractor_mean_abs_effect_ratio": nullable_float(ratio),
+        "by_position": by_position,
     }
 
 

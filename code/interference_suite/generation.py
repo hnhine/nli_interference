@@ -126,8 +126,12 @@ def generate_suite(
     return rows
 
 
-def sample_base_events(n_base_events: int, rng: random.Random) -> list[Event]:
-    candidates = all_events()
+def sample_base_events(
+    n_base_events: int,
+    rng: random.Random,
+    verbs: Sequence[VerbSpec] = VERBS,
+) -> list[Event]:
+    candidates = all_events(verbs=verbs)
     if n_base_events > len(candidates):
         raise ValueError(f"Requested {n_base_events} base events, but only {len(candidates)} are available")
     rng.shuffle(candidates)
@@ -217,21 +221,52 @@ def generate_exp2(base_id: str, claim_event: Event, rng: random.Random) -> list[
 def generate_exp3(base_id: str, claim_event: Event, rng: random.Random, include_sanity: bool = False) -> list[dict[str, Any]]:
     rows = []
     for match_idx in (1, 2, 3):
-        for match_polarity in ("positive", "negative"):
-            distractors = clean_distractors(claim_event, rng, count=2)
-            distractor_polarities: list[Polarity] = ["positive", "positive"]
-            rows.append(
-                make_exp3_row(
-                    base_id=base_id,
-                    claim_event=claim_event,
-                    match_idx=match_idx,
-                    match_polarity=match_polarity,
-                    distractors=distractors,
-                    distractor_polarities=distractor_polarities,
-                    sanity_type="",
-                    sample_suffix=f"idx{match_idx}_{compact_polarity(match_polarity)}",
+        # Keep event identities fixed across the full 2 x 3 minimal-pair cell:
+        # target polarity (+/-) x distractor configuration (anchor/flip d1/flip d2).
+        # The anchor distractor polarities are randomized reproducibly by ``rng``.
+        distractors = clean_distractors(claim_event, rng, count=2)
+        anchor_distractor_polarities: tuple[Polarity, Polarity] = (
+            rng.choice(("positive", "negative")),
+            rng.choice(("positive", "negative")),
+        )
+        distractor_positions = [idx for idx in (1, 2, 3) if idx != match_idx]
+        configurations: list[tuple[str, int | None, tuple[Polarity, Polarity]]] = [
+            ("anchor", None, anchor_distractor_polarities),
+        ]
+        for distractor_offset, source_position in enumerate(distractor_positions):
+            flipped = list(anchor_distractor_polarities)
+            flipped[distractor_offset] = flip_exp3_polarity(flipped[distractor_offset])
+            configurations.append((f"flip_d{source_position}", source_position, tuple(flipped)))
+
+        for config, flipped_distractor_idx, distractor_polarities in configurations:
+            distractor_pattern = "".join(polarity_symbol(p) for p in distractor_polarities)
+            for match_polarity in ("positive", "negative"):
+                target_pair_id = f"exp3_{base_id}_idx{match_idx}_{config}"
+                distractor_cell_id = f"exp3_{base_id}_idx{match_idx}_{compact_polarity(match_polarity)}"
+                rows.append(
+                    make_exp3_row(
+                        base_id=base_id,
+                        claim_event=claim_event,
+                        match_idx=match_idx,
+                        match_polarity=match_polarity,
+                        distractors=distractors,
+                        distractor_polarities=distractor_polarities,
+                        sanity_type="",
+                        sample_suffix=(
+                            f"idx{match_idx}_{compact_polarity(match_polarity)}_{config}"
+                        ),
+                        extra={
+                            "exp3_design": "minimal_pairs_v2",
+                            "exp3_distractor_config": config,
+                            "exp3_distractor_pattern": distractor_pattern,
+                            "exp3_flipped_distractor_idx": (
+                                "" if flipped_distractor_idx is None else flipped_distractor_idx
+                            ),
+                            "exp3_target_pair_id": target_pair_id,
+                            "exp3_distractor_cell_id": distractor_cell_id,
+                        },
+                    )
                 )
-            )
 
     if include_sanity:
         rows.extend(generate_exp3_sanity(base_id, claim_event, rng))
@@ -247,6 +282,7 @@ def make_exp3_row(
     distractor_polarities: Sequence[Polarity],
     sanity_type: str,
     sample_suffix: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_label = "T" if match_polarity == "positive" else "F"
     expected_sign = 1 if match_polarity == "positive" else -1
@@ -282,8 +318,13 @@ def make_exp3_row(
             "match_polarity": match_polarity,
             "sanity_type": sanity_type,
             "phase_cos": 1 if match_polarity == "positive" else -1,
+            **(extra or {}),
         },
     )
+
+
+def flip_exp3_polarity(polarity: Polarity) -> Polarity:
+    return "negative" if polarity == "positive" else "positive"
 
 
 def generate_exp3_sanity(base_id: str, claim_event: Event, rng: random.Random) -> list[dict[str, Any]]:
