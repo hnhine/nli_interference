@@ -1,0 +1,1488 @@
+"""Pure data contracts for Section 6.2 naturalistic ablations.
+
+This module deliberately contains no model or intervention code.  It pins the
+frozen Section 5 rotations, verifies the R1 behavioral handoff, constructs the
+pre-intervention analysis membership, and checks rotation artifacts before a
+GPU-backed runner loads a model.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+from .section62_data import FULL_CELL_ORDER, RHO_SAME_DONOR, sha256_file
+
+
+R1_SCHEMA_VERSION = 1
+R1_RUN_TYPE = "section62_behavioral_gate"
+R2_ANALYSIS_SCOPE = "baseline_correct_secondary_only"
+FULL_SQUARE_ANALYSIS_SCOPE = "full_square_mtf_primary"
+ANALYSIS_POPULATIONS = frozenset({"baseline-correct", "full-square"})
+DEFAULT_MIN_BASELINE_CORRECT_PER_CELL = 50
+EXPECTED_R1_INPUT_ROWS = {
+    "square_valid": 620,
+    "all_u": 404,
+}
+
+EXPECTED_LABEL_BY_STRATUM = {
+    "square_valid": {
+        "++": "T",
+        "-+": "F",
+        "+-": "F",
+        "--": "T",
+    },
+    "all_u": {cell: "U" for cell in FULL_CELL_ORDER},
+}
+PORTABILITY_PAIR_CELLS = {
+    "negation_count_parity": ("++", "--"),
+    "negation_position": ("-+", "+-"),
+}
+PERMITTED_INPUT_SITES = frozenset({"claim_final", "answer_token"})
+
+
+class Section62AblationContractError(ValueError):
+    """Raised when an R2 handoff or frozen artifact violates its contract."""
+
+
+@dataclass(frozen=True)
+class FrozenSiteProfile:
+    """A preregistered pair of rho and m rotations at one execution site."""
+
+    model_name: str
+    model_key: str
+    reported_site: str
+    layer: int
+    rank: int
+    hidden_size: int
+    rho_rotation_dir: str
+    m_rotation_dir: str
+    rho_metadata_site: str
+    m_metadata_site: str
+
+
+FROZEN_PROFILES: Mapping[str, Mapping[str, FrozenSiteProfile]] = {
+    "microsoft/Phi-4-mini-instruct": {
+        "claim_final": FrozenSiteProfile(
+            model_name="microsoft/Phi-4-mini-instruct",
+            model_key="phi4",
+            reported_site="claim_final",
+            layer=12,
+            rank=64,
+            hidden_size=3072,
+            rho_rotation_dir=(
+                "data/das/phi4_rho_r64_stride2_1ep/L12_row"
+            ),
+            m_rotation_dir=(
+                "data/das/phi4_m_v4_r64_stride2/L12_claim_final"
+            ),
+            rho_metadata_site="row",
+            m_metadata_site="claim_final",
+        ),
+        "answer_token": FrozenSiteProfile(
+            model_name="microsoft/Phi-4-mini-instruct",
+            model_key="phi4",
+            reported_site="answer_token",
+            layer=16,
+            rank=64,
+            hidden_size=3072,
+            rho_rotation_dir=(
+                "data/das/phi4_rho_r64_stride2_1ep/L16_answer_token"
+            ),
+            m_rotation_dir=(
+                "data/das/phi4_m_v4_r64_stride2/L16_answer_token"
+            ),
+            rho_metadata_site="answer_token",
+            m_metadata_site="answer_token",
+        ),
+    },
+    "Qwen/Qwen3-8B": {
+        "claim_final": FrozenSiteProfile(
+            model_name="Qwen/Qwen3-8B",
+            model_key="qwen",
+            reported_site="claim_final",
+            layer=18,
+            rank=16,
+            hidden_size=4096,
+            rho_rotation_dir=(
+                "data/das/qwen_rho_v1_r16_stride2_1ep_b32/"
+                "L18_claim_final"
+            ),
+            m_rotation_dir=(
+                "data/das/qwen_m_v4_r16_stride2_1ep_b32/"
+                "L18_claim_final"
+            ),
+            rho_metadata_site="claim_final",
+            m_metadata_site="claim_final",
+        ),
+        "answer_token": FrozenSiteProfile(
+            model_name="Qwen/Qwen3-8B",
+            model_key="qwen",
+            reported_site="answer_token",
+            layer=32,
+            rank=16,
+            hidden_size=4096,
+            rho_rotation_dir=(
+                "data/das/qwen_rho_v1_r16_stride2_1ep_b32/"
+                "L32_answer_token"
+            ),
+            m_rotation_dir=(
+                "data/das/qwen_m_v4_r16_stride2_1ep_b32/"
+                "L32_answer_token"
+            ),
+            rho_metadata_site="answer_token",
+            m_metadata_site="answer_token",
+        ),
+    },
+}
+
+# Exact identities of the preregistered Section 5 artifacts.  Paths alone are
+# insufficient because a later retraining can overwrite a compatible-looking
+# rotation in place.
+FROZEN_ROTATION_SHA256: Mapping[str, Mapping[str, str]] = {
+    "data/das/qwen_m_v4_r16_stride2_1ep_b32/L18_claim_final": {
+        "rotation_weight_metadata.json": (
+            "22712bb3a7ec7bd785b0f5ab5c77dcb58f05d2513f21bea5f2130fd266b2b18c"
+        ),
+        "rotation_weight.npy": (
+            "2861f06fb513bc90118b920e33dfe6323b8654fbd85a32b640db2cb01032c23d"
+        ),
+        "rotation_weight.pt": (
+            "d28f53f5d9a7d914a2be70f85701056a9a9f641394a294a341857d67fc225f36"
+        ),
+    },
+    "data/das/qwen_rho_v1_r16_stride2_1ep_b32/L18_claim_final": {
+        "rotation_weight_metadata.json": (
+            "456525e00325d6c3b1a9c3fe7e3d1d32106d078fe6df2bc023b551bc22b0a64b"
+        ),
+        "rotation_weight.npy": (
+            "dac508ba579dc717f214e13f267ceef24b7bdd29bf465e5164840ae89204a55a"
+        ),
+        "rotation_weight.pt": (
+            "0bbdfb12584984d6998f78fe9d9293731ba615c89cbc281662c0649ad45cab9c"
+        ),
+    },
+    "data/das/qwen_m_v4_r16_stride2_1ep_b32/L32_answer_token": {
+        "rotation_weight_metadata.json": (
+            "e0e6163e4b340748051b6c48faae9207baf4920f161e2cd530ce71d77f80715d"
+        ),
+        "rotation_weight.npy": (
+            "34406277b9baba8249931990ce43b2f3e64ad1ad7d5f4450994329f8d1ea5a62"
+        ),
+        "rotation_weight.pt": (
+            "e5db865337cbb196ef3b15c6bb26f53b9fccc34dba9dbcfb53fb757cc6bd2962"
+        ),
+    },
+    "data/das/qwen_rho_v1_r16_stride2_1ep_b32/L32_answer_token": {
+        "rotation_weight_metadata.json": (
+            "3e04a2dd14d55d06078f3fb4a428159ce8b3ecea658b1037e1768e265d0d7cfd"
+        ),
+        "rotation_weight.npy": (
+            "501f44c7d6208de876ec0ea95bdb88a4925185be8a57fb02a885b48a54625188"
+        ),
+        "rotation_weight.pt": (
+            "7593201a305efb11a7ebed5df5e45009034878902a8fb297051542fa4b2f5af2"
+        ),
+    },
+    "data/das/phi4_m_v4_r64_stride2/L12_claim_final": {
+        "rotation_weight_metadata.json": (
+            "8770f6bdc1fb3243037dcd16af80ebdb5c5a03962f8f37e81ed028ff2dcf8a76"
+        ),
+        "rotation_weight.npy": (
+            "8cb5b928d447871463bdf9b8cea000a55cd382a8bb09298575ff6a805a9d833a"
+        ),
+        "rotation_weight.pt": (
+            "091fb5e85afbc7164f341836d70c34ea5a429ce9e6c52fa5c4500566c59973ea"
+        ),
+    },
+    "data/das/phi4_rho_r64_stride2_1ep/L12_row": {
+        "rotation_weight_metadata.json": (
+            "7efec35caf1b8e04b124f32272ab71c383221b73f848e23c4d5748bb8895c6b7"
+        ),
+        "rotation_weight.npy": (
+            "07fb445f1c474f5ca78ed142206780a2490b1e9b328540559175a7a9fb869f28"
+        ),
+        "rotation_weight.pt": (
+            "ae218ffe96b03eaf404822aa39fe3885b6c5b052ded239e0802b54681cb0de23"
+        ),
+    },
+    "data/das/phi4_m_v4_r64_stride2/L16_answer_token": {
+        "rotation_weight_metadata.json": (
+            "2da4b8f609cd37bf879d12cf94017c48bcda65efca9e6a21eaf1d3d6f7deb607"
+        ),
+        "rotation_weight.npy": (
+            "7a973bc43fd449f5c755b4efb31562a15905ab99a7c515414fa2f82107ff652c"
+        ),
+        "rotation_weight.pt": (
+            "6761297313ddb5d3121c3646e0c991ea02cd42c605cce0a7436d3a4624193ea6"
+        ),
+    },
+    "data/das/phi4_rho_r64_stride2_1ep/L16_answer_token": {
+        "rotation_weight_metadata.json": (
+            "58fb429787556627ab9f6bdf6d09890dade5cfd91d8123d7d7578de11197a1d3"
+        ),
+        "rotation_weight.npy": (
+            "e40bb24a4f500f4a24718ba69c8db10c21271905db36009e1fae697ad8d3c142"
+        ),
+        "rotation_weight.pt": (
+            "97087630ab8878350e8b490f5413ae9b1a52040842d0e27746e3e61683c7a043"
+        ),
+    },
+}
+
+
+@dataclass(frozen=True)
+class R1Handoff:
+    """Hash-verified R1 rows and their provenance."""
+
+    model_name: str
+    summary_path: Path
+    scored_path: Path
+    summary: dict[str, Any]
+    rows: tuple[dict[str, str], ...]
+    provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AnalysisMembership:
+    """Fixed pre-intervention row, donor-pair, and whole-square membership."""
+
+    rows: tuple[dict[str, Any], ...]
+    summary: dict[str, Any]
+
+
+def frozen_profiles_for_model(model_name: str) -> tuple[FrozenSiteProfile, ...]:
+    """Return the frozen claim-final and answer-token profiles for a model."""
+
+    profiles = FROZEN_PROFILES.get(model_name)
+    if profiles is None:
+        raise Section62AblationContractError(
+            f"No frozen Section 6.2 profile for model {model_name!r}"
+        )
+    return tuple(profiles[site] for site in ("claim_final", "answer_token"))
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise Section62AblationContractError(
+                f"Duplicate JSON key {key!r}"
+            )
+        value[key] = item
+    return value
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise Section62AblationContractError(
+            f"Cannot read {label} JSON at {path}: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise Section62AblationContractError(
+            f"{label} at {path} must be a JSON object"
+        )
+    return value
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            if len(fieldnames) != len(set(fieldnames)):
+                raise Section62AblationContractError(
+                    f"R1 scored CSV has duplicate header fields: {fieldnames}"
+                )
+            return list(reader)
+    except OSError as error:
+        raise Section62AblationContractError(
+            f"Cannot read R1 scored CSV at {path}: {error}"
+        ) from error
+
+
+def _binary(value: Any, *, context: str) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise Section62AblationContractError(
+            f"{context} must be binary, found {value!r}"
+        ) from error
+    if numeric not in {0.0, 1.0}:
+        raise Section62AblationContractError(
+            f"{context} must be binary, found {value!r}"
+        )
+    return int(numeric)
+
+
+def _manifest_bool(value: Any, *, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise Section62AblationContractError(
+            f"{context} must be a JSON boolean, found {value!r}"
+        )
+    return value
+
+
+def _verify_file_record(
+    path: Path,
+    record: Mapping[str, Any],
+    *,
+    label: str,
+    actual_rows: int | None = None,
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise Section62AblationContractError(f"{label} does not exist: {path}")
+    expected_sha256 = str(record.get("sha256", ""))
+    expected_bytes = int(record.get("bytes", -1))
+    actual_sha256 = sha256_file(path)
+    actual_bytes = path.stat().st_size
+    if expected_sha256 != actual_sha256:
+        raise Section62AblationContractError(
+            f"{label} SHA256 mismatch: manifest={expected_sha256}, "
+            f"actual={actual_sha256}"
+        )
+    if expected_bytes != actual_bytes:
+        raise Section62AblationContractError(
+            f"{label} byte-size mismatch: manifest={expected_bytes}, "
+            f"actual={actual_bytes}"
+        )
+    if actual_rows is not None:
+        expected_rows = int(record.get("rows", -1))
+        if expected_rows != actual_rows:
+            raise Section62AblationContractError(
+                f"{label} row mismatch: manifest={expected_rows}, "
+                f"actual={actual_rows}"
+            )
+    return {
+        "path": str(path),
+        "sha256": actual_sha256,
+        "bytes": actual_bytes,
+        **({"rows": actual_rows} if actual_rows is not None else {}),
+    }
+
+def _span_index(
+    row: Mapping[str, Any],
+    field: str,
+    *,
+    context: str,
+) -> int:
+    try:
+        return int(row[field])
+    except (KeyError, TypeError, ValueError) as error:
+        raise Section62AblationContractError(
+            f"{context} has invalid {field}={row.get(field)!r}"
+        ) from error
+
+
+def _validate_prompt_contract(
+    row: Mapping[str, Any],
+    prefix: str,
+    *,
+    sample_id: str,
+) -> None:
+    context = f"R1 row {sample_id} {prefix}"
+    prompt = str(row[f"{prefix}_prompt"])
+    claim = str(row[f"{prefix}_claim"])
+    site = str(row[f"{prefix}_site"])
+    if site not in PERMITTED_INPUT_SITES:
+        raise Section62AblationContractError(
+            f"{context} site={site!r}, expected one of "
+            f"{sorted(PERMITTED_INPUT_SITES)}"
+        )
+
+    claim_start = _span_index(
+        row, f"{prefix}_claim_span_start", context=context
+    )
+    claim_end = _span_index(
+        row, f"{prefix}_claim_span_end", context=context
+    )
+    if not 0 <= claim_start < claim_end <= len(prompt):
+        raise Section62AblationContractError(
+            f"{context} has out-of-range claim span "
+            f"[{claim_start}, {claim_end})"
+        )
+    if prompt[claim_start:claim_end] != claim:
+        raise Section62AblationContractError(
+            f"{context} claim span does not recover {prefix}_claim"
+        )
+
+    answer_start = _span_index(
+        row, f"{prefix}_answer_span_start", context=context
+    )
+    answer_end = _span_index(
+        row, f"{prefix}_answer_span_end", context=context
+    )
+    if not 0 <= answer_start < answer_end <= len(prompt):
+        raise Section62AblationContractError(
+            f"{context} has out-of-range answer span "
+            f"[{answer_start}, {answer_end})"
+        )
+    if prompt[answer_start:answer_end] != "Answer:":
+        raise Section62AblationContractError(
+            f"{context} answer span does not recover 'Answer:'"
+        )
+    if claim_end > answer_start or prompt[answer_end:].strip():
+        raise Section62AblationContractError(
+            f"{context} answer span is not the final prompt field"
+        )
+
+
+
+def _validate_r1_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    model_name: str,
+) -> None:
+    if not rows:
+        raise Section62AblationContractError("R1 scored CSV is empty")
+    required = {
+        "prompt",
+        "target_label",
+        "target_var",
+        "base_label",
+        "base_prompt",
+        "base_claim",
+        "base_site",
+        "base_claim_span_start",
+        "base_claim_span_end",
+        "base_answer_span_start",
+        "base_answer_span_end",
+        "source_label",
+        "source_prompt",
+        "source_claim",
+        "source_site",
+        "source_claim_span_start",
+        "source_claim_span_end",
+        "source_answer_span_start",
+        "source_answer_span_end",
+        "sample_id",
+        "rho_src",
+        "model_name",
+        "condition",
+        "corpus",
+        "triple_id",
+        "analysis_stratum",
+        "cell",
+        "expected_label",
+        "pred_label",
+        "is_correct",
+        "rho_base",
+        "portability_group",
+        "portability_donor_cell",
+        "portability_donor_sample_id",
+    }
+    by_id: dict[str, Mapping[str, Any]] = {}
+    groups: dict[tuple[str, str, str], dict[str, Mapping[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        missing = sorted(
+            field
+            for field in required
+            if field not in row or str(row[field]).strip() == ""
+        )
+        if missing:
+            raise Section62AblationContractError(
+                f"R1 row {index} is missing fields: {missing}"
+            )
+        sample_id = str(row["sample_id"])
+        _validate_prompt_contract(row, "base", sample_id=sample_id)
+        _validate_prompt_contract(row, "source", sample_id=sample_id)
+        if str(row["target_var"]) != "rho":
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has target_var={row['target_var']!r}"
+            )
+        if str(row["prompt"]) != str(row["base_prompt"]):
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} prompt does not equal base_prompt"
+            )
+        if sample_id in by_id:
+            raise Section62AblationContractError(
+                f"Duplicate R1 sample_id {sample_id!r}"
+            )
+        by_id[sample_id] = row
+        if str(row["model_name"]) != model_name:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has model_name={row['model_name']!r}, "
+                f"expected {model_name!r}"
+            )
+        if str(row["condition"]) != "base":
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} is not an unablated base row"
+            )
+        stratum = str(row["analysis_stratum"])
+        cell = str(row["cell"])
+        if stratum not in EXPECTED_LABEL_BY_STRATUM:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has unsupported stratum {stratum!r}"
+            )
+        if cell not in FULL_CELL_ORDER:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has unknown cell {cell!r}"
+            )
+        required_label = EXPECTED_LABEL_BY_STRATUM[stratum][cell]
+        if str(row["expected_label"]) != required_label:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} requires expected_label "
+                f"{required_label!r}"
+            )
+        if not (
+            str(row["base_label"])
+            == str(row["target_label"])
+            == required_label
+        ):
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has inconsistent base/target labels"
+            )
+        prediction = str(row["pred_label"])
+        if prediction not in {"T", "F", "U"}:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has invalid prediction {prediction!r}"
+            )
+        correct = _binary(
+            row["is_correct"], context=f"R1 row {sample_id} is_correct"
+        )
+        if correct != int(prediction == required_label):
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has inconsistent is_correct"
+            )
+        expected_rho = 1.0 if cell in {"++", "--"} else -1.0
+        try:
+            rho = float(row["rho_base"])
+        except (TypeError, ValueError) as error:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has invalid rho_base"
+            ) from error
+        if rho != expected_rho:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} cell={cell} requires rho={expected_rho}"
+            )
+        expected_group = (
+            "negation_count_parity"
+            if cell in {"++", "--"}
+            else "negation_position"
+        )
+        if str(row["portability_group"]) != expected_group:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has wrong portability_group"
+            )
+        if str(row["portability_donor_cell"]) != RHO_SAME_DONOR[cell]:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has wrong portability donor cell"
+            )
+        group_key = (
+            str(row["corpus"]),
+            stratum,
+            str(row["triple_id"]),
+        )
+        group = groups.setdefault(group_key, {})
+        if cell in group:
+            raise Section62AblationContractError(
+                f"R1 group {group_key} has duplicate cell {cell!r}"
+            )
+        group[cell] = row
+
+    expected_cells = set(FULL_CELL_ORDER)
+    for group_key, group in groups.items():
+        if set(group) != expected_cells:
+            raise Section62AblationContractError(
+                f"R1 group {group_key} has cells={sorted(group)}, "
+                f"expected={list(FULL_CELL_ORDER)}"
+            )
+
+    for sample_id, row in by_id.items():
+        donor_id = str(row["portability_donor_sample_id"])
+        donor = by_id.get(donor_id)
+        if donor is None:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} donor {donor_id!r} is missing"
+            )
+        if (
+            str(donor["corpus"]) != str(row["corpus"])
+            or str(donor["analysis_stratum"])
+            != str(row["analysis_stratum"])
+            or str(donor["triple_id"]) != str(row["triple_id"])
+        ):
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} donor leaves its square"
+            )
+        if str(donor["cell"]) != RHO_SAME_DONOR[str(row["cell"])]:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} donor has the wrong cell"
+            )
+        if str(donor["portability_donor_sample_id"]) != sample_id:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} donor relation is not reciprocal"
+            )
+
+        materialized_text_fields = (
+            ("source_prompt", "base_prompt"),
+            ("source_claim", "base_claim"),
+            ("source_label", "base_label"),
+            ("source_site", "base_site"),
+        )
+        for source_field, donor_field in materialized_text_fields:
+            if str(row[source_field]) != str(donor[donor_field]):
+                raise Section62AblationContractError(
+                    f"R1 row {sample_id} {source_field} does not match "
+                    f"donor {donor_field}"
+                )
+        materialized_span_fields = (
+            ("source_claim_span_start", "base_claim_span_start"),
+            ("source_claim_span_end", "base_claim_span_end"),
+            ("source_answer_span_start", "base_answer_span_start"),
+            ("source_answer_span_end", "base_answer_span_end"),
+        )
+        for source_field, donor_field in materialized_span_fields:
+            source_value = _span_index(
+                row, source_field, context=f"R1 row {sample_id}"
+            )
+            donor_value = _span_index(
+                donor, donor_field, context=f"R1 donor {donor_id}"
+            )
+            if source_value != donor_value:
+                raise Section62AblationContractError(
+                    f"R1 row {sample_id} {source_field} does not match "
+                    f"donor {donor_field}"
+                )
+        try:
+            rho_src = float(row["rho_src"])
+            donor_rho = float(donor["rho_base"])
+        except (TypeError, ValueError) as error:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} has invalid donor rho"
+            ) from error
+        if rho_src != donor_rho:
+            raise Section62AblationContractError(
+                f"R1 row {sample_id} rho_src does not match donor rho_base"
+            )
+
+
+def _crosscheck_r1_summary(
+    summary: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    actual: dict[tuple[str, str, str], tuple[int, int]] = {}
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[
+            (
+                str(row["corpus"]),
+                str(row["analysis_stratum"]),
+                str(row["cell"]),
+            )
+        ].append(row)
+    for key, values in grouped.items():
+        actual[key] = (
+            len(values),
+            sum(_binary(row["is_correct"], context="R1 is_correct") for row in values),
+        )
+
+    recorded_rows = summary.get("by_cell")
+    if not isinstance(recorded_rows, list):
+        raise Section62AblationContractError("R1 summary is missing by_cell")
+    recorded: dict[tuple[str, str, str], tuple[int, int]] = {}
+    for value in recorded_rows:
+        if not isinstance(value, dict):
+            raise Section62AblationContractError(
+                "Every R1 by_cell entry must be an object"
+            )
+        key = (
+            str(value.get("corpus", "")),
+            str(value.get("analysis_stratum", "")),
+            str(value.get("cell", "")),
+        )
+        if key in recorded:
+            raise Section62AblationContractError(
+                f"Duplicate R1 by_cell entry {key}"
+            )
+        recorded[key] = (int(value.get("n", -1)), int(value.get("n_correct", -1)))
+    if recorded != actual:
+        raise Section62AblationContractError(
+            "R1 summary by_cell counts do not match scored.csv"
+        )
+
+
+def load_r1_handoff(
+    summary_path: str | Path,
+    *,
+    scored_path: str | Path | None = None,
+    expected_model_name: str | None = None,
+    expected_corpora: Iterable[str] = ("MNLI",),
+    verify_r0_manifest: bool = False,
+    repo_root: str | Path | None = None,
+) -> R1Handoff:
+    """Load and verify an R1 behavioral artifact for secondary R2 analysis."""
+
+    summary_file = Path(summary_path)
+    summary = _read_json_object(summary_file, label="R1 summary")
+    if summary.get("schema_version") != R1_SCHEMA_VERSION:
+        raise Section62AblationContractError(
+            f"Unsupported R1 schema {summary.get('schema_version')!r}"
+        )
+    if summary.get("run_type") != R1_RUN_TYPE:
+        raise Section62AblationContractError(
+            f"Unexpected R1 run_type {summary.get('run_type')!r}"
+        )
+    model_name = str(summary.get("model_name", ""))
+    if not model_name:
+        raise Section62AblationContractError("R1 summary has no model_name")
+    if expected_model_name is not None and model_name != expected_model_name:
+        raise Section62AblationContractError(
+            f"R1 model mismatch: summary={model_name!r}, "
+            f"expected={expected_model_name!r}"
+        )
+    run = summary.get("run")
+    if not isinstance(run, dict) or str(run.get("model_name", "")) != model_name:
+        raise Section62AblationContractError(
+            "R1 run metadata does not match top-level model_name"
+        )
+
+    artifacts = summary.get("artifacts")
+    if not isinstance(artifacts, dict) or not isinstance(
+        artifacts.get("scored"), dict
+    ):
+        raise Section62AblationContractError(
+            "R1 summary is missing artifacts.scored"
+        )
+    scored_record = artifacts["scored"]
+    recorded_path_value = str(scored_record.get("path", "")).strip()
+    if not recorded_path_value:
+        raise Section62AblationContractError(
+            "R1 artifacts.scored has no path"
+        )
+    recorded_path = Path(recorded_path_value)
+    manifest_scored_path = (
+        recorded_path
+        if recorded_path.is_absolute()
+        else summary_file.parent / recorded_path
+    )
+    if scored_path is not None:
+        supplied_scored_path = Path(scored_path)
+        if supplied_scored_path.resolve() != manifest_scored_path.resolve():
+            raise Section62AblationContractError(
+                "Supplied scored CSV is not the artifact pinned by R1"
+            )
+    rows = _read_csv(manifest_scored_path)
+    scored_provenance = _verify_file_record(
+        manifest_scored_path,
+        scored_record,
+        label="R1 scored artifact",
+        actual_rows=len(rows),
+    )
+    if int(summary.get("n_rows", -1)) != len(rows):
+        raise Section62AblationContractError(
+            "R1 top-level n_rows does not match scored.csv"
+        )
+
+    _validate_r1_rows(rows, model_name=model_name)
+    actual_corpora = {str(row["corpus"]) for row in rows}
+    required_corpora = {str(corpus) for corpus in expected_corpora}
+    if actual_corpora != required_corpora:
+        raise Section62AblationContractError(
+            f"R1 corpora={sorted(actual_corpora)}, "
+            f"expected={sorted(required_corpora)}"
+        )
+    _crosscheck_r1_summary(summary, rows)
+
+    gate_rows = summary.get("by_stratum")
+    if not isinstance(gate_rows, list):
+        raise Section62AblationContractError(
+            "R1 summary is missing by_stratum gates"
+        )
+    gates: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for gate in gate_rows:
+        if not isinstance(gate, dict):
+            raise Section62AblationContractError(
+                "Every R1 by_stratum entry must be an object"
+            )
+        key = (
+            str(gate.get("corpus", "")),
+            str(gate.get("analysis_stratum", "")),
+        )
+        if key in gates:
+            raise Section62AblationContractError(
+                f"Duplicate R1 stratum gate {key}"
+            )
+        gates[key] = gate
+    expected_gate_keys = {
+        (corpus, stratum)
+        for corpus in required_corpora
+        for stratum in EXPECTED_LABEL_BY_STRATUM
+    }
+    if set(gates) != expected_gate_keys:
+        raise Section62AblationContractError(
+            f"R1 gate keys={sorted(gates)}, expected={sorted(expected_gate_keys)}"
+        )
+    for key, gate in gates.items():
+        strict = _manifest_bool(
+            gate.get("strict_gate_eligible"),
+            context=f"R1 gate {key} strict_gate_eligible",
+        )
+        secondary = _manifest_bool(
+            gate.get("secondary_baseline_correct_eligible"),
+            context=f"R1 gate {key} secondary_baseline_correct_eligible",
+        )
+        if strict:
+            raise Section62AblationContractError(
+                f"R1 gate {key} passed strict; this handoff is configured "
+                "for baseline-correct secondary analysis"
+            )
+        if not secondary:
+            raise Section62AblationContractError(
+                f"R1 gate {key} lacks enough baseline-correct rows"
+            )
+        if str(gate.get("interpretation_scope", "")) != R2_ANALYSIS_SCOPE:
+            raise Section62AblationContractError(
+                f"R1 gate {key} has unexpected interpretation scope"
+            )
+
+    r0_provenance: dict[str, Any] | None = None
+    input_provenance: dict[str, Any] | None = None
+    if verify_r0_manifest:
+        if repo_root is None:
+            raise Section62AblationContractError(
+                "repo_root is required when verify_r0_manifest=True"
+            )
+        repository = Path(repo_root)
+        r0_record = summary.get("r0_manifest")
+        if not isinstance(r0_record, dict):
+            raise Section62AblationContractError(
+                "R1 summary is missing r0_manifest provenance"
+            )
+        r0_path = Path(str(r0_record.get("path", "")))
+        if not r0_path.is_absolute():
+            r0_path = repository / r0_path
+        r0_provenance = _verify_file_record(
+            r0_path,
+            r0_record,
+            label="R0 manifest",
+        )
+
+        inputs = summary.get("inputs")
+        matched_artifacts = r0_record.get("matched_artifacts")
+        if not isinstance(inputs, dict):
+            raise Section62AblationContractError(
+                "R1 summary is missing inputs provenance"
+            )
+        if not isinstance(matched_artifacts, dict):
+            raise Section62AblationContractError(
+                "R1 r0_manifest is missing matched_artifacts"
+            )
+        input_roles = {
+            "square_samples": "square_valid",
+            "all_u_samples": "all_u",
+        }
+        if set(inputs) != set(input_roles):
+            raise Section62AblationContractError(
+                f"R1 input keys={sorted(inputs)}, "
+                f"expected={sorted(input_roles)}"
+            )
+        if set(matched_artifacts) != set(input_roles.values()):
+            raise Section62AblationContractError(
+                "R1 R0 matched-artifact roles are incomplete"
+            )
+
+        input_provenance = {}
+        for input_name, role in input_roles.items():
+            input_record = inputs[input_name]
+            matched_record = matched_artifacts[role]
+            if not isinstance(input_record, dict) or not isinstance(
+                matched_record, dict
+            ):
+                raise Section62AblationContractError(
+                    f"R1 provenance for {input_name}/{role} must be objects"
+                )
+            input_path_value = str(input_record.get("path", "")).strip()
+            matched_path_value = str(matched_record.get("path", "")).strip()
+            if not input_path_value or not matched_path_value:
+                raise Section62AblationContractError(
+                    f"R1 provenance for {input_name}/{role} has no path"
+                )
+            input_path = Path(input_path_value)
+            if not input_path.is_absolute():
+                input_path = repository / input_path
+            matched_path = Path(matched_path_value)
+            if not matched_path.is_absolute():
+                matched_path = repository / matched_path
+            if input_path.resolve() != matched_path.resolve():
+                raise Section62AblationContractError(
+                    f"R1 input {input_name} path does not match R0 role {role}"
+                )
+            input_rows = _read_csv(input_path)
+            expected_rows = EXPECTED_R1_INPUT_ROWS[role]
+            if len(input_rows) != expected_rows:
+                raise Section62AblationContractError(
+                    f"R1 input {input_name} has {len(input_rows)} rows, "
+                    f"expected {expected_rows}"
+                )
+            verified = _verify_file_record(
+                input_path,
+                input_record,
+                label=f"R1 input {input_name}",
+                actual_rows=len(input_rows),
+            )
+            for field in ("rows", "sha256", "bytes"):
+                if str(input_record.get(field)) != str(
+                    matched_record.get(field)
+                ):
+                    raise Section62AblationContractError(
+                        f"R1 input {input_name} {field} does not match "
+                        f"R0 role {role}"
+                    )
+            artifact_name = str(matched_record.get("artifact_name", ""))
+            if artifact_name != role and not artifact_name.endswith(f"_{role}"):
+                raise Section62AblationContractError(
+                    f"R0 artifact {artifact_name!r} cannot serve role {role!r}"
+                )
+            input_provenance[role] = {
+                **verified,
+                "input_name": input_name,
+                "r0_artifact_name": artifact_name,
+            }
+
+    summary_provenance = {
+        "path": str(summary_file),
+        "sha256": sha256_file(summary_file),
+        "bytes": summary_file.stat().st_size,
+    }
+    provenance = {
+        "summary": summary_provenance,
+        "scored": scored_provenance,
+        "r0_manifest": r0_provenance,
+        "inputs": input_provenance,
+        "analysis_scope": R2_ANALYSIS_SCOPE,
+    }
+    return R1Handoff(
+        model_name=model_name,
+        summary_path=summary_file,
+        scored_path=manifest_scored_path,
+        summary=summary,
+        rows=tuple(dict(row) for row in rows),
+        provenance=provenance,
+    )
+
+
+def _exclusion_reason(base_correct: int, donor_correct: int) -> str:
+    if base_correct and donor_correct:
+        return ""
+    if not base_correct and not donor_correct:
+        return "base_and_donor_baseline_incorrect"
+    if not base_correct:
+        return "base_baseline_incorrect"
+    return "donor_baseline_incorrect"
+
+
+def build_analysis_membership(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    min_baseline_correct_per_cell: int = DEFAULT_MIN_BASELINE_CORRECT_PER_CELL,
+    require_secondary_eligible: bool = True,
+) -> AnalysisMembership:
+    """Freeze row, reciprocal-pair, and whole-square eligibility from R1 only."""
+
+    if min_baseline_correct_per_cell < 1:
+        raise Section62AblationContractError(
+            "min_baseline_correct_per_cell must be positive"
+        )
+    model_names = {str(row.get("model_name", "")) for row in rows}
+    if len(model_names) != 1 or "" in model_names:
+        raise Section62AblationContractError(
+            f"Membership rows must contain one model, found {sorted(model_names)}"
+        )
+    model_name = next(iter(model_names))
+    _validate_r1_rows(rows, model_name=model_name)
+
+    by_id = {str(row["sample_id"]): row for row in rows}
+    square_groups: dict[
+        tuple[str, str, str], dict[str, Mapping[str, Any]]
+    ] = {}
+    for row in rows:
+        key = (
+            str(row["corpus"]),
+            str(row["analysis_stratum"]),
+            str(row["triple_id"]),
+        )
+        square_groups.setdefault(key, {})[str(row["cell"])] = row
+
+    membership_rows: list[dict[str, Any]] = []
+    for row in rows:
+        sample_id = str(row["sample_id"])
+        donor = by_id[str(row["portability_donor_sample_id"])]
+        base_correct = _binary(
+            row["is_correct"], context=f"R1 row {sample_id} is_correct"
+        )
+        donor_correct = _binary(
+            donor["is_correct"],
+            context=f"R1 donor {donor['sample_id']} is_correct",
+        )
+        key = (
+            str(row["corpus"]),
+            str(row["analysis_stratum"]),
+            str(row["triple_id"]),
+        )
+        group = square_groups[key]
+        n_correct = sum(
+            _binary(value["is_correct"], context="R1 square is_correct")
+            for value in group.values()
+        )
+        whole_eligible = int(n_correct == len(FULL_CELL_ORDER))
+        portability_group = str(row["portability_group"])
+        pair_cells = PORTABILITY_PAIR_CELLS[portability_group]
+        pair_id = (
+            f"{key[0]}:{key[1]}:{key[2]}:{portability_group}"
+        )
+        membership_rows.append(
+            {
+                "model_name": model_name,
+                "sample_id": sample_id,
+                "corpus": key[0],
+                "analysis_stratum": key[1],
+                "triple_id": key[2],
+                "cell": str(row["cell"]),
+                "expected_label": str(row["expected_label"]),
+                "baseline_pred_label": str(row["pred_label"]),
+                "baseline_is_correct": base_correct,
+                "rho_base": float(row["rho_base"]),
+                "join_override_used": _binary(
+                    row.get("join_override_used", 0) or 0,
+                    context=f"R1 row {sample_id} join_override_used",
+                ),
+                "row_eligible": base_correct,
+                "row_exclusion_reason": (
+                    "" if base_correct else "baseline_incorrect"
+                ),
+                "portability_group": portability_group,
+                "portability_pair_id": pair_id,
+                "portability_pair_cell_a": pair_cells[0],
+                "portability_pair_cell_b": pair_cells[1],
+                "portability_donor_cell": str(
+                    row["portability_donor_cell"]
+                ),
+                "portability_donor_sample_id": str(
+                    row["portability_donor_sample_id"]
+                ),
+                "donor_baseline_is_correct": donor_correct,
+                "pair_eligible": int(base_correct and donor_correct),
+                "pair_exclusion_reason": _exclusion_reason(
+                    base_correct, donor_correct
+                ),
+                "whole_square_n_correct": n_correct,
+                "whole_square_eligible": whole_eligible,
+                "whole_square_exclusion_reason": (
+                    ""
+                    if whole_eligible
+                    else "one_or_more_cells_baseline_incorrect"
+                ),
+                "analysis_scope": R2_ANALYSIS_SCOPE,
+            }
+        )
+
+    by_cell: list[dict[str, Any]] = []
+    for corpus in sorted({str(row["corpus"]) for row in rows}):
+        for stratum in EXPECTED_LABEL_BY_STRATUM:
+            for cell in FULL_CELL_ORDER:
+                values = [
+                    row
+                    for row in membership_rows
+                    if row["corpus"] == corpus
+                    and row["analysis_stratum"] == stratum
+                    and row["cell"] == cell
+                ]
+                if not values:
+                    raise Section62AblationContractError(
+                        f"No membership rows for {corpus}:{stratum}:{cell}"
+                    )
+                by_cell.append(
+                    {
+                        "model_name": model_name,
+                        "corpus": corpus,
+                        "analysis_stratum": stratum,
+                        "cell": cell,
+                        "n_rows": len(values),
+                        "n_row_eligible": sum(
+                            int(row["row_eligible"]) for row in values
+                        ),
+                    }
+                )
+
+    by_stratum: list[dict[str, Any]] = []
+    strata = sorted(
+        {
+            (str(row["corpus"]), str(row["analysis_stratum"]))
+            for row in membership_rows
+        }
+    )
+    for corpus, stratum in strata:
+        values = [
+            row
+            for row in membership_rows
+            if row["corpus"] == corpus
+            and row["analysis_stratum"] == stratum
+        ]
+        cell_counts = [
+            row["n_row_eligible"]
+            for row in by_cell
+            if row["corpus"] == corpus
+            and row["analysis_stratum"] == stratum
+        ]
+        min_count = min(int(value) for value in cell_counts)
+        secondary = min_count >= min_baseline_correct_per_cell
+        by_stratum.append(
+            {
+                "model_name": model_name,
+                "corpus": corpus,
+                "analysis_stratum": stratum,
+                "n_rows": len(values),
+                "n_row_eligible": sum(
+                    int(row["row_eligible"]) for row in values
+                ),
+                "n_squares": len(
+                    {str(row["triple_id"]) for row in values}
+                ),
+                "n_whole_square_eligible": len(
+                    {
+                        str(row["triple_id"])
+                        for row in values
+                        if int(row["whole_square_eligible"]) == 1
+                    }
+                ),
+                "min_baseline_correct_per_cell": min_count,
+                "required_baseline_correct_per_cell": (
+                    min_baseline_correct_per_cell
+                ),
+                "secondary_eligible": secondary,
+            }
+        )
+        if require_secondary_eligible and not secondary:
+            raise Section62AblationContractError(
+                f"{corpus}:{stratum} has only {min_count} baseline-correct "
+                "rows in its worst cell"
+            )
+
+    by_pair_group: list[dict[str, Any]] = []
+    seen_pair_ids: set[str] = set()
+    for row in membership_rows:
+        pair_id = str(row["portability_pair_id"])
+        if pair_id in seen_pair_ids:
+            continue
+        seen_pair_ids.add(pair_id)
+        pair_rows = [
+            value
+            for value in membership_rows
+            if value["portability_pair_id"] == pair_id
+        ]
+        if len(pair_rows) != 2:
+            raise Section62AblationContractError(
+                f"Portability pair {pair_id} has {len(pair_rows)} rows"
+            )
+        first = pair_rows[0]
+        by_pair_group.append(
+            {
+                "model_name": model_name,
+                "corpus": first["corpus"],
+                "analysis_stratum": first["analysis_stratum"],
+                "portability_group": first["portability_group"],
+                "portability_pair_id": pair_id,
+                "triple_id": first["triple_id"],
+                "pair_eligible": int(first["pair_eligible"]),
+            }
+        )
+
+    pair_group_summary: list[dict[str, Any]] = []
+    pair_keys = sorted(
+        {
+            (
+                str(row["corpus"]),
+                str(row["analysis_stratum"]),
+                str(row["portability_group"]),
+            )
+            for row in by_pair_group
+        }
+    )
+    for corpus, stratum, portability_group in pair_keys:
+        values = [
+            row
+            for row in by_pair_group
+            if row["corpus"] == corpus
+            and row["analysis_stratum"] == stratum
+            and row["portability_group"] == portability_group
+        ]
+        pair_group_summary.append(
+            {
+                "model_name": model_name,
+                "corpus": corpus,
+                "analysis_stratum": stratum,
+                "portability_group": portability_group,
+                "n_pairs": len(values),
+                "n_pair_eligible": sum(
+                    int(row["pair_eligible"]) for row in values
+                ),
+                "n_eligible_directions": 2
+                * sum(int(row["pair_eligible"]) for row in values),
+            }
+        )
+
+    summary = {
+        "model_name": model_name,
+        "analysis_scope": R2_ANALYSIS_SCOPE,
+        "n_rows": len(membership_rows),
+        "n_row_eligible": sum(
+            int(row["row_eligible"]) for row in membership_rows
+        ),
+        "by_cell": by_cell,
+        "by_stratum": by_stratum,
+        "by_pair_group": pair_group_summary,
+    }
+    return AnalysisMembership(
+        rows=tuple(membership_rows),
+        summary=summary,
+    )
+
+
+def preflight_rotation_metadata(
+    rotation_dir: str | Path,
+    *,
+    expected_target_var: str,
+    expected_model_name: str,
+    expected_layer: int,
+    expected_rank: int,
+    expected_hidden_size: int,
+    allowed_metadata_sites: Iterable[str],
+    expected_sha256: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate a rotation directory and NPY header without loading a model."""
+
+    directory = Path(rotation_dir)
+    metadata_path = directory / "rotation_weight_metadata.json"
+    metadata = _read_json_object(metadata_path, label="rotation metadata")
+    expected = {
+        "target_var": expected_target_var,
+        "model_name": expected_model_name,
+        "layer": expected_layer,
+        "rank": expected_rank,
+        "component": "block_output",
+    }
+    for field, expected_value in expected.items():
+        actual = metadata.get(field)
+        if field in {"layer", "rank"}:
+            try:
+                actual = int(actual)
+            except (TypeError, ValueError) as error:
+                raise Section62AblationContractError(
+                    f"{metadata_path}: invalid {field}={actual!r}"
+                ) from error
+        if actual != expected_value:
+            raise Section62AblationContractError(
+                f"{metadata_path}: {field}={actual!r}, "
+                f"expected {expected_value!r}"
+            )
+    metadata_site = str(metadata.get("site", ""))
+    allowed_sites = {str(site) for site in allowed_metadata_sites}
+    if metadata_site not in allowed_sites:
+        raise Section62AblationContractError(
+            f"{metadata_path}: site={metadata_site!r}, "
+            f"expected one of {sorted(allowed_sites)}"
+        )
+
+    weights = metadata.get("weights")
+    if not isinstance(weights, dict) or len(weights) != 1:
+        raise Section62AblationContractError(
+            f"{metadata_path}: weights must contain exactly one entry"
+        )
+    weight_name, weight_record = next(iter(weights.items()))
+    if not isinstance(weight_record, dict):
+        raise Section62AblationContractError(
+            f"{metadata_path}: weight entry {weight_name!r} must be an object"
+        )
+    shape = weight_record.get("shape")
+    expected_shape = [expected_hidden_size, expected_rank]
+    if shape != expected_shape:
+        raise Section62AblationContractError(
+            f"{metadata_path}: metadata shape={shape!r}, "
+            f"expected {expected_shape!r}"
+        )
+    recorded_npy = Path(str(weight_record.get("npy_path", "")))
+    if recorded_npy.name != "rotation_weight.npy":
+        raise Section62AblationContractError(
+            f"{metadata_path}: invalid npy_path={str(recorded_npy)!r}"
+        )
+    npy_path = directory / recorded_npy.name
+    if not npy_path.is_file():
+        raise Section62AblationContractError(
+            f"Rotation NPY does not exist: {npy_path}"
+        )
+    try:
+        import numpy as np
+
+        array = np.load(npy_path, mmap_mode="r", allow_pickle=False)
+    except (ImportError, OSError, ValueError) as error:
+        raise Section62AblationContractError(
+            f"Cannot inspect rotation NPY {npy_path}: {error}"
+        ) from error
+    if list(array.shape) != expected_shape:
+        raise Section62AblationContractError(
+            f"{npy_path}: actual shape={list(array.shape)}, "
+            f"expected={expected_shape}"
+        )
+    if array.dtype.kind != "f":
+        raise Section62AblationContractError(
+            f"{npy_path}: expected floating dtype, found {array.dtype}"
+        )
+
+    pt_record: dict[str, Any] | None = None
+    recorded_pt_value = weight_record.get("pt_path")
+    if recorded_pt_value:
+        pt_path = directory / Path(str(recorded_pt_value)).name
+        if not pt_path.is_file():
+            raise Section62AblationContractError(
+                f"Rotation PT does not exist: {pt_path}"
+            )
+        pt_record = {
+            "path": str(pt_path),
+            "sha256": sha256_file(pt_path),
+            "bytes": pt_path.stat().st_size,
+        }
+
+    actual_sha256 = {
+        "rotation_weight_metadata.json": sha256_file(metadata_path),
+        "rotation_weight.npy": sha256_file(npy_path),
+        **(
+            {"rotation_weight.pt": str(pt_record["sha256"])}
+            if pt_record is not None
+            else {}
+        ),
+    }
+    if expected_sha256 is not None:
+        if set(expected_sha256) != set(actual_sha256):
+            raise Section62AblationContractError(
+                f"{directory}: frozen SHA fields={sorted(expected_sha256)}, "
+                f"actual fields={sorted(actual_sha256)}"
+            )
+        for filename, expected_digest in expected_sha256.items():
+            actual_digest = actual_sha256[filename]
+            if actual_digest != expected_digest:
+                raise Section62AblationContractError(
+                    f"{directory / filename}: frozen SHA256 mismatch: "
+                    f"expected={expected_digest}, actual={actual_digest}"
+                )
+
+    return {
+        "target_var": expected_target_var,
+        "model_name": expected_model_name,
+        "layer": expected_layer,
+        "rank": expected_rank,
+        "hidden_size": expected_hidden_size,
+        "component": "block_output",
+        "metadata_site": metadata_site,
+        "weight_name": str(weight_name),
+        "shape": expected_shape,
+        "dtype": str(array.dtype),
+        "metadata": {
+            "path": str(metadata_path),
+            "sha256": sha256_file(metadata_path),
+            "bytes": metadata_path.stat().st_size,
+        },
+        "rotation_weight_npy": {
+            "path": str(npy_path),
+            "sha256": sha256_file(npy_path),
+            "bytes": npy_path.stat().st_size,
+        },
+        "rotation_weight_pt": pt_record,
+    }
+
+
+def preflight_frozen_profile(
+    profile: FrozenSiteProfile,
+    *,
+    repo_root: str | Path,
+) -> dict[str, Any]:
+    """Preflight both trained subspaces for one frozen model/site profile."""
+
+    root = Path(repo_root)
+    rho = preflight_rotation_metadata(
+        root / profile.rho_rotation_dir,
+        expected_target_var="rho",
+        expected_model_name=profile.model_name,
+        expected_layer=profile.layer,
+        expected_rank=profile.rank,
+        expected_hidden_size=profile.hidden_size,
+        allowed_metadata_sites=(profile.rho_metadata_site,),
+        expected_sha256=FROZEN_ROTATION_SHA256.get(
+            profile.rho_rotation_dir
+        ),
+    )
+    m_control = preflight_rotation_metadata(
+        root / profile.m_rotation_dir,
+        expected_target_var="m",
+        expected_model_name=profile.model_name,
+        expected_layer=profile.layer,
+        expected_rank=profile.rank,
+        expected_hidden_size=profile.hidden_size,
+        allowed_metadata_sites=(profile.m_metadata_site,),
+        expected_sha256=FROZEN_ROTATION_SHA256.get(
+            profile.m_rotation_dir
+        ),
+    )
+    if (
+        rho["rotation_weight_npy"]["sha256"]
+        == m_control["rotation_weight_npy"]["sha256"]
+    ):
+        raise Section62AblationContractError(
+            "rho and m profiles unexpectedly reference identical weights"
+        )
+    if profile.rho_metadata_site == "row":
+        if profile.reported_site != "claim_final":
+            raise Section62AblationContractError(
+                "A legacy row rotation may resolve only to claim_final"
+            )
+        rho_resolved_site = "claim_final"
+    else:
+        rho_resolved_site = profile.rho_metadata_site
+    if rho_resolved_site != profile.reported_site:
+        raise Section62AblationContractError(
+            f"rho metadata site {profile.rho_metadata_site!r} does not "
+            f"resolve to reported site {profile.reported_site!r}"
+        )
+    if profile.m_metadata_site != profile.reported_site:
+        raise Section62AblationContractError(
+            f"m metadata site {profile.m_metadata_site!r} does not match "
+            f"reported site {profile.reported_site!r}"
+        )
+    return {
+        "model_name": profile.model_name,
+        "model_key": profile.model_key,
+        "reported_site": profile.reported_site,
+        "layer": profile.layer,
+        "rank": profile.rank,
+        "hidden_size": profile.hidden_size,
+        "rho_metadata_site": profile.rho_metadata_site,
+        "rho_resolved_site": rho_resolved_site,
+        "m_metadata_site": profile.m_metadata_site,
+        "rho": rho,
+        "m": m_control,
+    }
+
+
+def preflight_frozen_profiles(
+    model_name: str,
+    *,
+    repo_root: str | Path,
+) -> tuple[dict[str, Any], ...]:
+    """Preflight both frozen sites for one model without loading that model."""
+
+    return tuple(
+        preflight_frozen_profile(profile, repo_root=repo_root)
+        for profile in frozen_profiles_for_model(model_name)
+    )

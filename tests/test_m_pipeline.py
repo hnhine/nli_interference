@@ -15,6 +15,7 @@ from interference_suite.das_data import (  # noqa: E402
 )
 from run_das_ablation import (  # noqa: E402
     build_donor_indices,
+    resolve_condition_column,
     resolve_condition_hold_columns,
     resolve_donor_event_policy,
     resolve_donor_pool,
@@ -45,6 +46,9 @@ class MDonorTests(unittest.TestCase):
         ])
         self.assertEqual(resolve_donor_pool("m", "auto"), "m_main")
         self.assertEqual(resolve_donor_event_policy("m", "auto"), "require")
+    def test_auto_rho_configuration(self):
+        self.assertEqual(resolve_condition_column("rho", "auto"), "rho_base")
+        self.assertEqual(resolve_condition_hold_columns("rho", "auto"), ["m_base"])
 
     def test_m_cross_control_donor_holds_and_excludes_trap(self):
         rows = self.synthetic_rows()

@@ -1,4 +1,8 @@
-"""Create publication-ready figures for the Exp2b structural-overlap gate."""
+"""Create publication-ready figures for the Exp2b structural-overlap gate.
+
+The confidence intervals in the main panel are obtained by bootstrapping base
+events, so the four polarity combinations of an event are kept together.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from matplotlib.patches import Patch
 
 
 ROOT = Path("/workspace/nhi/nli_interference")
@@ -37,14 +40,7 @@ DISPLAY_LABELS = {
     "S-only": "Verb + object\nmismatch (S-only)",
     "none": "No content\nmatch",
 }
-# Hue identifies the overlap regime; shade identifies the model.
-# Full structural matches are orange, while all mismatch controls are blue.
-BAR_COLORS = {
-    ("Qwen3-8B", "full"): "#C55400",     # dark orange
-    ("Phi-4-mini", "full"): "#F2A65A",  # light orange
-    ("Qwen3-8B", "other"): "#1F5A94",   # dark blue
-    ("Phi-4-mini", "other"): "#8DBDDD", # light blue
-}
+COLORS = {"Qwen3-8B": "#31688E", "Phi-4-mini": "#E07A3F"}
 
 
 def load_exp2b() -> pd.DataFrame:
@@ -69,13 +65,31 @@ def load_exp2b() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def mean_summary(data: pd.DataFrame) -> pd.DataFrame:
-    """Summarize the mean unknown-label margin for each model and overlap type."""
-    return (
-        data.groupby(["model", "overlap_type"], sort=False, as_index=False)["U_gap"]
-        .mean()
-        .rename(columns={"U_gap": "mean_G_U"})
-    )
+def cluster_bootstrap_summary(
+    data: pd.DataFrame, n_boot: int = 5000, seed: int = 20260718
+) -> pd.DataFrame:
+    """Summarize mean U-gap with a base-event bootstrap confidence interval."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for (model, overlap), group in data.groupby(["model", "overlap_type"], sort=False):
+        event_means = group.groupby("base_event_id", sort=False)["U_gap"].mean().to_numpy()
+        n_events = len(event_means)
+        boot_means = np.empty(n_boot)
+        for start in range(0, n_boot, 250):
+            stop = min(start + 250, n_boot)
+            sampled = rng.integers(0, n_events, size=(stop - start, n_events))
+            boot_means[start:stop] = event_means[sampled].mean(axis=1)
+        low, high = np.quantile(boot_means, [0.025, 0.975])
+        rows.append(
+            {
+                "model": model,
+                "overlap_type": overlap,
+                "mean_G_U": event_means.mean(),
+                "ci_low": low,
+                "ci_high": high,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def plot_gate_panel(
@@ -95,7 +109,7 @@ def plot_gate_panel(
     legend_fontsize = 10.5 if compact_paper else None
 
     ax.axhspan(0, 4.2, color="#E8F3F7", alpha=0.72, zorder=0)
-    ax.axhspan(-4.8, 0, color="#F4D8CB", alpha=0.88, zorder=0)
+    ax.axhspan(-4.8, 0, color="#F8ECE7", alpha=0.72, zorder=0)
     ax.axhline(0, color="#333333", linewidth=1.15, zorder=1)
     ax.axvline(0.5, color="#777777", linestyle=(0, (3, 3)), linewidth=1.0, zorder=1)
 
@@ -103,66 +117,59 @@ def plot_gate_panel(
         model_rows = summary.loc[summary["model"] == model].set_index("overlap_type")
         model_rows = model_rows.loc[OVERLAP_ORDER]
         means = model_rows["mean_G_U"].to_numpy()
+        low = model_rows["ci_low"].to_numpy()
+        high = model_rows["ci_high"].to_numpy()
         positions = x + offsets[model]
-        bar_colors = [
-            BAR_COLORS[(model, "full" if overlap == "SVO" else "other")]
-            for overlap in OVERLAP_ORDER
-        ]
-        bars = ax.bar(
+        ax.errorbar(
             positions,
             means,
-            width=bar_width,
-            color=bar_colors,
-            edgecolor="none",
-            linewidth=0,
+            yerr=np.vstack([means - low, high - means]),
+            fmt="o",
+            markersize=9.0 if compact_paper else 7.5,
+            capsize=3.5,
+            elinewidth=1.5,
+            markeredgecolor="white",
+            markeredgewidth=0.8,
+            color=COLORS[model],
+            label=model,
             zorder=3,
         )
-        for position, value, bar_color in zip(positions, means, bar_colors):
-            label_y = value + 0.12 if value >= 0 else value - 0.14
+        for position, value in zip(positions, means):
+            vertical_offset = (
+                0.42 if compact_paper else (0.22 if value >= 0 else -0.32)
+            )
             ax.text(
                 position,
-                label_y,
+                value + vertical_offset,
                 f"{value:.2f}",
                 ha="center",
-                va="bottom" if value >= 0 else "top",
+                va="center",
                 fontsize=value_fontsize,
-                color="#8A3F12" if value < 0 else bar_color,
+                color=COLORS[model],
                 fontweight="semibold",
             )
 
     ax.text(4.48, 3.78, "U preferred", ha="right", va="top", fontsize=annotation_fontsize, color="#275D70")
-    ax.text(4.48, -4.38, "T/F preferred", ha="right", va="bottom", fontsize=annotation_fontsize, color="#8A4B32", fontweight="bold")
+    ax.text(4.48, -4.38, "T/F preferred", ha="right", va="bottom", fontsize=annotation_fontsize, color="#8A4B32")
     ax.text(0.25, 4.08, "structural gate", ha="center", va="top", fontsize=10.5 if compact_paper else 9, color="#555555")
     ax.set_xticks(x, [DISPLAY_LABELS[item] for item in OVERLAP_ORDER])
     ylabel = (
-        r"Unknown label margin $G_U$"
+        "Unknown-label margin"
         if compact_paper
-        else r"Unknown label margin $G_U = L_U - \max(L_T,L_F)$"
+        else r"Unknown-label margin  $G_U = L_U - \max(L_T,L_F)$"
     )
     ax.set_ylabel(ylabel, fontsize=axis_fontsize)
     ax.set_ylim(-4.8, 4.2)
     ax.set_xlim(-0.48, 4.52)
-    legend_handles = [
-        Patch(facecolor=BAR_COLORS[("Qwen3-8B", "full")], edgecolor="none", label="full match · Qwen3-8B"),
-        Patch(facecolor=BAR_COLORS[("Phi-4-mini", "full")], edgecolor="none", label="full match · Phi-4 Mini"),
-        Patch(facecolor=BAR_COLORS[("Qwen3-8B", "other")], edgecolor="none", label="other groups · Qwen3-8B"),
-        Patch(facecolor=BAR_COLORS[("Phi-4-mini", "other")], edgecolor="none", label="other groups · Phi-4 Mini"),
-    ]
     ax.legend(
-        handles=legend_handles,
         loc="lower center",
         ncol=2,
         frameon=True,
         bbox_to_anchor=(0.50, 0.015),
-        fontsize=9.0 if compact_paper else legend_fontsize,
-        columnspacing=2.0,
-        handlelength=1.4,
-        handletextpad=0.5,
-        labelspacing=0.55,
+        fontsize=legend_fontsize,
     )
     if compact_paper:
         ax.tick_params(axis="both", labelsize=tick_fontsize)
-    ax.set_axisbelow(True)
     ax.grid(axis="y", color="white", linewidth=1.1)
     ax.grid(axis="x", visible=False)
     if show_panel_title:
@@ -234,7 +241,7 @@ def main() -> None:
     )
 
     data = load_exp2b()
-    summary = mean_summary(data)
+    summary = cluster_bootstrap_summary(data)
 
     # Main standalone panel for layouts that use a single-column result figure.
     main_fig, main_ax = plt.subplots(figsize=(10.4, 3.5))
@@ -245,7 +252,7 @@ def main() -> None:
         compact_paper=True,
     )
     main_fig.tight_layout()
-    save_figure(main_fig, "GU_model_compare")
+    save_figure(main_fig, "exp2b_gate_GU_model_comparison")
     plt.close(main_fig)
 
     # Complete multi-panel figure: gate contrast plus polarity stability.
@@ -285,7 +292,7 @@ def main() -> None:
     save_figure(fig, "exp2b_gate_combined")
     plt.close(fig)
 
-    summary.to_csv(OUTPUT_DIR / "exp2b_gate_GU_summary.csv", index=False)
+    summary.to_csv(OUTPUT_DIR / "exp2b_gate_GU_bootstrap_summary.csv", index=False)
     print(f"Saved figures and summary to {OUTPUT_DIR}")
 
 

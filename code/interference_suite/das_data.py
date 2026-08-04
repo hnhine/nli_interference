@@ -17,6 +17,7 @@ DEFAULT_DAS_TARGETS = ("pc", "pi", "m")
 PC_VARIANTS = ("legacy", "v4")
 PI_VARIANTS = ("legacy", "v4", "v5")
 M_VARIANTS = ("legacy", "v4")
+RHO_VARIANTS = ("legacy", "v2")
 POLARITIES: tuple[Polarity, Polarity] = ("positive", "negative")
 POLARITY_TO_SIGN = {"positive": 1, "negative": -1}
 SIGN_TO_POLARITY: dict[int, Polarity] = {1: "positive", -1: "negative"}
@@ -82,6 +83,7 @@ def generate_das_pairs(
     pc_variant: str = "legacy",
     pi_variant: str = "legacy",
     m_variant: str = "legacy",
+    rho_variant: str = "legacy",
 ) -> list[dict[str, Any]]:
     selected = tuple(targets or DEFAULT_DAS_TARGETS)
     unknown = sorted(set(selected) - set(DAS_TARGETS))
@@ -103,6 +105,10 @@ def generate_das_pairs(
         raise ValueError(f"Unknown m variant: {m_variant!r}; choose from {M_VARIANTS}")
     if m_variant != "legacy" and set(selected) != {"m"}:
         raise ValueError("A non-legacy --m-variant requires --targets m only")
+    if rho_variant not in RHO_VARIANTS:
+        raise ValueError(f"Unknown rho variant: {rho_variant!r}; choose from {RHO_VARIANTS}")
+    if rho_variant != "legacy" and set(selected) != {"rho"}:
+        raise ValueError("A non-legacy --rho-variant requires --targets rho only")
 
     rng = random.Random(seed)
     base_verbs = M_INDEPENDENT_VERBS if m_verb_policy == "independent_v1" else VERBS
@@ -162,6 +168,7 @@ def generate_das_pairs(
                         matched_idx,
                         rng,
                         excluded_keys,
+                        rho_variant=rho_variant,
                     )
                 )
 
@@ -174,7 +181,11 @@ def generate_das_pairs(
         elif row.get("m_variant") == "v4":
             row["run_family"] = "das_atomic_m_v4"
         elif row.get("target_var") == "rho":
-            row["run_family"] = "das_atomic_rho"
+            row["run_family"] = (
+                "das_atomic_rho_v2"
+                if row.get("rho_variant") == "v2"
+                else "das_atomic_rho"
+            )
         else:
             row["run_family"] = "das_atomic"
     return rows
@@ -771,6 +782,7 @@ def generate_rho_pairs(
     matched_idx: int,
     rng: random.Random,
     excluded_keys: frozenset[str] = frozenset(),
+    rho_variant: str = "legacy",
 ) -> list[dict[str, Any]]:
     """Generate identified pre-gate rho = p_i * p_c intervention pairs.
 
@@ -778,8 +790,9 @@ def generate_rho_pairs(
     not match the claim. The base gate alone determines whether transferred rho
     controls T/F (m_base=1) or is suppressed to U (m_base=0).
 
-    Default DAS training uses all six controls; source_m0 complements
-    label_copy_trap by distinguishing pre-gate rho from source label/gated REL.
+    The legacy design uses six controls. V2 adds ``source_m0_same``, the
+    missing cross-state/same-rho cell needed to distinguish faithful source
+    transfer from an intervention that merely reverses the base relation.
     """
 
     rows: list[dict[str, Any]] = []
@@ -813,6 +826,7 @@ def generate_rho_pairs(
                 base_site="claim_final",
                 source_site="claim_final",
                 extra={
+                    "rho_variant": rho_variant,
                     "m_src": source.m_i,
                     "p_i_src": source.p_i,
                     "p_c_src": source.p_c,
@@ -933,6 +947,37 @@ def generate_rho_pairs(
                     inactive_source.p_c,
                 ),
             )
+
+            if rho_variant == "v2":
+                # Minimal-pair control for source_m0: retain the exact
+                # closed-gate source event structure, distractors, claim, and
+                # all non-designated polarities, changing only the designated
+                # premise polarity so rho_source == rho_base.
+                inactive_same_polarities = replace_tuple(
+                    inactive_source.assumption_polarities,
+                    matched_idx,
+                    p_i_base,
+                )
+                inactive_same_source = make_example(
+                    claim_event,
+                    matched_idx,
+                    m_i=0,
+                    p_i=p_i_base,
+                    p_c=p_c_base,
+                    rng=rng,
+                    assumption_events=inactive_source.assumption_events,
+                    assumption_polarities=inactive_same_polarities,
+                )
+                add_pair(
+                    control_type="source_m0_same",
+                    base=active_base,
+                    source=inactive_same_source,
+                    target_label=high_level_label(
+                        active_base.m_i,
+                        inactive_same_source.p_i,
+                        inactive_same_source.p_c,
+                    ),
+                )
 
             inactive_base = make_example(
                 claim_event,
@@ -1240,7 +1285,7 @@ def make_example(
         events = tuple(assumption_events)
 
     if assumption_polarities is None:
-        polarities = default_polarities(matched_idx, p_i)
+        polarities = default_polarities(matched_idx, p_i, rng)
     else:
         polarities = tuple(assumption_polarities)
 
@@ -1331,13 +1376,19 @@ def assumption_events_for_slot(
     return tuple(events)
 
 
-def default_polarities(matched_idx: int, p_i: Polarity) -> tuple[Polarity, ...]:
+def default_polarities(matched_idx: int, p_i: Polarity, rng: random.Random) -> tuple[Polarity, ...]:
+    """Slot polarity is p_i; distractor polarities are sampled uniformly.
+
+    Random distractor polarities break the confound between slot-level
+    variables (p_i, rho) and the prompt-wide negation count/parity.
+    """
+
     polarities: list[Polarity] = []
     for idx in range(3):
         if idx == matched_idx:
             polarities.append(p_i)
         else:
-            polarities.append("positive")
+            polarities.append(rng.choice(("positive", "negative")))
     return tuple(polarities)
 
 

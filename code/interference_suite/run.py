@@ -5,7 +5,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .das_data import DAS_TARGETS, DEFAULT_DAS_TARGETS, M_VARIANTS, PC_VARIANTS, PI_VARIANTS, generate_das_pairs
+from .das_data import (
+    DAS_TARGETS,
+    DEFAULT_DAS_TARGETS,
+    M_VARIANTS,
+    PC_VARIANTS,
+    PI_VARIANTS,
+    RHO_VARIANTS,
+    generate_das_pairs,
+)
 from .das_pyvene import run_pyvene_das
 from .generation import EXPERIMENTS, generate_exp6, generate_suite, generate_supplements, supplemental_sections_for_experiments
 from .hidden_dump import dump_das_hidden_states
@@ -236,6 +244,7 @@ def build_das_rows_from_args(args: argparse.Namespace) -> list[dict[str, object]
         pc_variant=args.pc_variant,
         pi_variant=args.pi_variant,
         m_variant=args.m_variant,
+        rho_variant=args.rho_variant,
     )
 
 
@@ -434,6 +443,13 @@ def add_das_generation_args(parser: argparse.ArgumentParser) -> None:
         choices=M_VARIANTS,
         help=("m pair design. legacy exactly preserves the previous generator; "
               "v4 adds an m_base=1, m_source=1 same-value label-copy trap."),
+    )
+    parser.add_argument(
+        "--rho-variant",
+        default="legacy",
+        choices=RHO_VARIANTS,
+        help=("rho pair design. legacy exactly preserves the six-control generator; "
+              "v2 adds the cross-state same-rho source_m0_same identification control."),
     )
     parser.add_argument("--output-dir", default="data/das/generated")
     parser.add_argument("--csv-name", default="pairs.csv")

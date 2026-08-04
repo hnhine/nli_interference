@@ -89,6 +89,13 @@ def run_pyvene_das(
             local_files_only=local_files_only,
         )
     label_tokens = resolve_label_tokens(tokenizer, label_token_style)
+    # Seed the global torch RNG so the low-rank rotation is initialised
+    # differently (and reproducibly) per seed. Without this, `seed` only
+    # controls batch order (rng below); the rotation init would not vary,
+    # so multi-seed runs could not test subspace-recovery robustness.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     intervenable = build_intervenable(pv, model, layer=layer, rank=rank, component=component)
     input_device = get_input_device(model, torch, device)
     set_intervenable_device(intervenable, input_device)
@@ -168,7 +175,17 @@ def run_pyvene_das(
     )
     # Headline metric over the interchange controls only, so trap/gate rows in
     # the test split cannot inflate or dilute the reported IIA.
-    core_controls = set(resolved_train_control_types(target_var, None))
+    available_controls = {
+        str(row.get("control_type", ""))
+        for row in target_rows
+    }
+    core_controls = set(
+        resolved_train_control_types(
+            target_var,
+            None,
+            available_controls=available_controls,
+        )
+    )
     test_core_metrics = summarize_scored(
         [row for row in test_scored if str(row.get("control_type")) in core_controls]
     )
@@ -208,7 +225,11 @@ def run_pyvene_das(
         "label_token_style": label_tokens.style,
         "n_train": len(train_rows),
         "n_train_all": len(all_train_rows),
-        "train_control_types": resolved_train_control_types(target_var, train_control_types),
+        "train_control_types": resolved_train_control_types(
+            target_var,
+            train_control_types,
+            available_controls=available_controls,
+        ),
         "train_control_proportions": resolved_control_proportions,
         "include_relaxed": include_relaxed,
         "n_relaxed_excluded": n_relaxed_excluded,
@@ -607,14 +628,26 @@ def drop_relaxed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def filter_train_rows(rows: list[dict[str, Any]], target_var: str, train_control_types: list[str] | None) -> list[dict[str, Any]]:
-    controls = resolved_train_control_types(target_var, train_control_types)
+    controls = resolved_train_control_types(
+        target_var,
+        train_control_types,
+        available_controls={
+            str(row.get("control_type", ""))
+            for row in rows
+        },
+    )
     if controls == ["all"]:
         return rows
     allowed = set(controls)
     return [row for row in rows if str(row.get("control_type")) in allowed]
 
 
-def resolved_train_control_types(target_var: str, train_control_types: list[str] | None) -> list[str]:
+def resolved_train_control_types(
+    target_var: str,
+    train_control_types: list[str] | None,
+    *,
+    available_controls: set[str] | None = None,
+) -> list[str]:
     values = train_control_types or ["auto"]
     if len(values) == 1 and values[0] == "auto":
         if target_var in {"pc", "pi"}:
@@ -622,7 +655,10 @@ def resolved_train_control_types(target_var: str, train_control_types: list[str]
         if target_var == "m":
             return ["match_to_nomatch", "nomatch_to_match"]
         if target_var == "rho":
-            return ["flip_pi", "flip_pc", "hold_both", "source_m0", "gate_m0", "label_copy_trap"]
+            controls = ["flip_pi", "flip_pc", "hold_both", "source_m0"]
+            if available_controls is not None and "source_m0_same" in available_controls:
+                controls.append("source_m0_same")
+            return [*controls, "gate_m0", "label_copy_trap"]
     return values
 
 

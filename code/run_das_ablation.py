@@ -189,7 +189,7 @@ def resolve_condition_column(target_var: str, condition_on: str) -> str:
     """Resolve the row column whose value defines same/opposite donor classes."""
     if condition_on != "auto":
         return condition_on
-    return {"pc": "p_c_base", "pi": "p_i_base", "m": "m_base"}.get(target_var, "base_label")
+    return {"rho": "rho_base", "pc": "p_c_base", "pi": "p_i_base", "m": "m_base"}.get(target_var, "base_label")
 
 
 M_MAIN_CONTROLS = frozenset({"match_to_nomatch", "nomatch_to_match"})
@@ -214,6 +214,8 @@ def resolve_condition_hold_columns(target_var: str, condition_hold: str | Sequen
     if condition_hold == "auto" or condition_hold == ["auto"]:
         if target_var == "m":
             return ["p_i_base", "p_c_base", "mismatch_type", "matched_idx"]
+        if target_var == "rho":
+            return ["m_base"]
         return []
     return parse_column_list(condition_hold)
 
@@ -503,12 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-name", required=True)
     p.add_argument("--target-var", default="pc")
     p.add_argument("--condition-on", default="auto",
-                   help="Column defining same/opposite donor classes; auto maps pc/pi/m to p_c_base/p_i_base/m_base.")
+                   help="Column defining same/opposite donor classes; auto maps rho/pc/pi/m to rho_base/p_c_base/p_i_base/m_base.")
     p.add_argument(
         "--condition-hold",
         default="auto",
         help=("Comma-separated nuisance columns fixed for same/opposite donors. "
-              "auto uses none for pc/pi and p_i_base,p_c_base,mismatch_type,matched_idx for m."),
+              "auto holds m_base for rho, nothing for pc/pi, and p_i_base,p_c_base,mismatch_type,matched_idx for m."),
     )
     p.add_argument(
         "--donor-pool",

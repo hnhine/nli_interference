@@ -114,6 +114,76 @@ class RhoGenerationTests(unittest.TestCase):
         rows = generate_das_pairs(n_base_events=1, seed=4)
         self.assertNotIn("rho", {row["target_var"] for row in rows})
 
+    def test_rho_v2_adds_balanced_cross_state_same_rho_control(self):
+        n_base_events = 4
+        rows = generate_das_pairs(
+            n_base_events=n_base_events,
+            seed=5,
+            targets=["rho"],
+            rho_variant="v2",
+        )
+        expected_per_control = n_base_events * 3 * 2 * 2
+        self.assertEqual(
+            Counter(row["control_type"] for row in rows),
+            Counter({
+                "flip_pi": expected_per_control,
+                "flip_pc": expected_per_control,
+                "hold_both": expected_per_control,
+                "source_m0": expected_per_control,
+                "source_m0_same": expected_per_control,
+                "gate_m0": expected_per_control,
+                "label_copy_trap": expected_per_control,
+            }),
+        )
+        self.assertEqual({row["rho_variant"] for row in rows}, {"v2"})
+        self.assertEqual({row["run_family"] for row in rows}, {"das_atomic_rho_v2"})
+
+    def test_rho_v2_source_m0_same_is_a_minimal_pair(self):
+        rows = generate_das_pairs(
+            n_base_events=3,
+            seed=6,
+            targets=["rho"],
+            rho_variant="v2",
+        )
+        by_id = {row["sample_id"]: row for row in rows}
+        same_rows = [row for row in rows if row["control_type"] == "source_m0_same"]
+        self.assertTrue(same_rows)
+
+        for same in same_rows:
+            opposite_id = same["sample_id"].replace("source_m0_same", "source_m0")
+            opposite = by_id[opposite_id]
+            self.assertEqual((same["m_base"], same["m_src"]), (1, 0))
+            self.assertEqual(same["rho_src"], same["rho_base"])
+            self.assertEqual(opposite["rho_src"], -int(opposite["rho_base"]))
+            self.assertEqual(same["target_label"], same["base_label"])
+            self.assertEqual(same["source_label"], "U")
+            self.assertEqual(same["source_claim"], opposite["source_claim"])
+
+            for field, value in opposite.items():
+                if field.startswith("source_source") and not field.endswith("_polarity"):
+                    self.assertEqual(same[field], value)
+
+            polarity_fields = [
+                f"source_source{idx}_polarity" for idx in (1, 2, 3)
+            ]
+            changed = [
+                field
+                for field in polarity_fields
+                if same[field] != opposite[field]
+            ]
+            self.assertEqual(
+                changed,
+                [f"source_source{int(same['matched_idx']) + 1}_polarity"],
+            )
+
+    def test_nonlegacy_rho_variant_requires_rho_only(self):
+        with self.assertRaisesRegex(ValueError, "requires --targets rho only"):
+            generate_das_pairs(
+                n_base_events=1,
+                targets=["rho", "pc"],
+                rho_variant="v2",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

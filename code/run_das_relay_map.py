@@ -51,6 +51,18 @@ PI_V5_DEFAULT_CONTROL_PROPORTIONS = {
     "distractor": 10.0,
 }
 
+RHO_V2_DEFAULT_CONTROL_PROPORTIONS = {
+    "flip_pi": 16.0,
+    "flip_pc": 16.0,
+    "hold_both": 16.0,
+    "source_m0": 16.0,
+    "source_m0_same": 16.0,
+    "gate_m0": 10.0,
+    "label_copy_trap": 10.0,
+}
+
+# Keep the six-control rho-v1 mix available so existing datasets and commands
+# retain their original behavior.
 RHO_DEFAULT_CONTROL_PROPORTIONS = {
     "flip_pi": 20.0,
     "flip_pc": 20.0,
@@ -230,6 +242,7 @@ def cell_record(layer: int, site: str, summary: dict) -> dict:
         "flip_pc_IIA": control_iia("flip_pc"),
         "hold_both_IIA": control_iia("hold_both"),
         "source_m0_IIA": control_iia("source_m0"),
+        "source_m0_same_IIA": control_iia("source_m0_same"),
         "match_to_nomatch_IIA": control_iia("match_to_nomatch"),
         "nomatch_to_match_IIA": control_iia("nomatch_to_match"),
         "distractor_IIA": control_iia("distractor"),
@@ -254,14 +267,20 @@ def cell_record(layer: int, site: str, summary: dict) -> dict:
     )
 
     record["rho_active_IIA"] = weighted_control_iia(
-        ("flip_pi", "flip_pc", "hold_both", "source_m0")
+        ("flip_pi", "flip_pc", "hold_both", "source_m0", "source_m0_same")
     )
     record["rho_inactive_IIA"] = weighted_control_iia(
         ("gate_m0", "label_copy_trap")
     )
+    rho_identity_controls = ["flip_pi", "flip_pc", "hold_both", "source_m0"]
+    # rho-v2 closes the cross-state/same-rho identification gap. Requiring the
+    # control only when it is present preserves rho-v1 relay-map semantics.
+    if "source_m0_same" in by_control:
+        rho_identity_controls.append("source_m0_same")
+    rho_identity_controls.append("label_copy_trap")
     identifying = [
         control_iia(name)
-        for name in ("flip_pi", "flip_pc", "hold_both", "source_m0", "label_copy_trap")
+        for name in rho_identity_controls
     ]
     record["rho_identification_min_IIA"] = (
         min(float(value) for value in identifying)
@@ -362,7 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=["auto"],
         help=("Training controls. For m, auto uses both transfer directions. For rho, "
-              "auto trains all six controls with the default 20/20/20/20/10/10 mix."),
+              "auto detects rho V2 first and uses five active controls at weight 16 each "
+              "plus gate_m0=10 and label_copy_trap=10; legacy rho datasets retain "
+              "the six-control 20/20/20/20/10/10 mix."),
     )
     parser.add_argument(
         "--train-control-proportions",
@@ -373,8 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
               "main=40 active_source_m0=40 gate_m0=5 label_copy_trap=5 distractor=10; "
               "pi V5 defaults to main=30 active_source_m0=30 flip_both=10 "
               "flip_pc=10 gate_m0=5 label_copy_trap=5 distractor=10; "
-              "rho defaults to flip_pi=20 flip_pc=20 hold_both=20 source_m0=20 "
-              "gate_m0=10 label_copy_trap=10; "
+              "rho V2 defaults to flip_pi=16 flip_pc=16 hold_both=16 "
+              "source_m0=16 source_m0_same=16 gate_m0=10 label_copy_trap=10; "
+              "legacy rho defaults to flip_pi=20 flip_pc=20 hold_both=20 "
+              "source_m0=20 gate_m0=10 label_copy_trap=10; "
               "other datasets retain their existing unstratified default. Example override: "
               "main=0.5 distractor=0.1666666667 gate_m0=0.1666666667 "
               "label_copy_trap=0.1666666667. Weights are normalized."),
@@ -437,6 +460,10 @@ def resolve_control_proportions(
             for row in rows
             if row.get("target_var") == "rho"
         }
+        # Check V2 before legacy because V2 is a strict superset of the
+        # original six-control design.
+        if set(RHO_V2_DEFAULT_CONTROL_PROPORTIONS) <= controls:
+            return dict(RHO_V2_DEFAULT_CONTROL_PROPORTIONS)
         if set(RHO_DEFAULT_CONTROL_PROPORTIONS) <= controls:
             return dict(RHO_DEFAULT_CONTROL_PROPORTIONS)
         return None

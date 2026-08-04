@@ -217,3 +217,60 @@ Granite 4.1 8B:
 Gemma 4 12B:
 
     python code/run_das_relay_map.py --samples data/das/m_1000_v2/pairs.csv --model-name google/gemma-4-12B --target-var m --layers 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 --sites claim_final answer_token --rank 16 --steps 750 --batch-size 32 --eval-batch-size 64 --learning-rate 0.002 --eval-interval 0 --seed 0 --train-control-types all --torch-dtype bfloat16 --local-files-only --output-dir data/das/gemma4_12b_m_allcontrols_r16_stride2
+
+## Section 6.1 lexical-negation evaluation
+
+This pipeline never trains a new rotation. It derives lexical variants from the
+held-out rows in the existing DAS datasets, verifies that the canonical
+`did_not` rendering is byte-identical, and evaluates exported rotations.
+
+Run the E0 integration gate on both cached tokenizers:
+
+    python code/check_section61_spans.py --local-files-only
+
+Generate all E1-E7 datasets from the existing 150-event test split:
+
+    python code/run_section61.py generate \
+      --rho-samples data/das/rho_v1/pairs.csv \
+      --pi-samples data/das/pi_v4/pairs.csv \
+      --pc-samples data/das/pc_v4/pairs.csv \
+      --m-samples data/das/m_v4/pairs.csv \
+      --n-events 150 \
+      --output-dir data/section61/generated
+
+Run the E1 behavioral gate separately for each model:
+
+    python code/run_section61.py behavioral \
+      --samples data/section61/generated/e1_behavioral.csv \
+      --model-name Qwen/Qwen3-8B --batch-size 64 --torch-dtype bfloat16 \
+      --local-files-only --output-dir data/section61/qwen/e1
+
+    python code/run_section61.py behavioral \
+      --samples data/section61/generated/e1_behavioral.csv \
+      --model-name microsoft/Phi-4-mini-instruct --batch-size 64 --torch-dtype bfloat16 \
+      --local-files-only --output-dir data/section61/phi4/e1
+
+Each DAS invocation loads one model and one frozen peak rotation, then evaluates
+all forms in the supplied CSV while retaining per-control metrics. For example,
+Qwen claim-final E2 is:
+
+    python code/run_section61.py das \
+      --samples data/section61/generated/e2_rho_within.csv \
+      --rotation-dir data/das/qwen_rho_v1_r16_stride2_1ep_b32/L18_claim_final \
+      --model-name Qwen/Qwen3-8B --eval-batch-size 64 --torch-dtype bfloat16 \
+      --local-files-only --output-dir data/section61/qwen/e2_claim
+
+For E7, require the separately scored E7 behavioral gate before DAS:
+
+    python code/run_section61.py das \
+      --samples data/section61/generated/e7_rho_double_negation.csv \
+      --require-gate-summary data/section61/qwen/e7_behavior/behavioral_summary.json \
+      --rotation-dir data/das/qwen_rho_v1_r16_stride2_1ep_b32/L18_claim_final \
+      --model-name Qwen/Qwen3-8B --eval-batch-size 64 --torch-dtype bfloat16 \
+      --local-files-only --output-dir data/section61/qwen/e7_claim
+
+Finally, aggregate the two behavioral summaries and all completed DAS summaries
+with `run_section61.py summarize`. The main table uses claim-final
+`rho_full_audit_min_IIA`; answer-token, E4-E7, and per-control records are
+written as appendix CSVs. Gate-failed forms remain in raw outputs but their body
+IIA cells are suppressed.

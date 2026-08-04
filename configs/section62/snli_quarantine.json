@@ -1,0 +1,5 @@
+{
+  "SNLI": {
+    "snli_0037": "Pinned upstream malformed triple at rows 111-113: all three hypotheses are identical, so H(+-) and H(-+) do not form a negation contrast."
+  }
+}

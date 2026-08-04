@@ -85,6 +85,10 @@ def resolve_token_site(tokenizer: Any, text: str, row: dict[str, Any], prefix: s
         return resolve_token_site(tokenizer, text, row, prefix, row_site)
     if site == "claim_final":
         return last_token_in_named_span(tokenizer, text, row, prefix, "claim")
+    if site == "premise_final":
+        return last_token_in_named_span(tokenizer, text, row, prefix, "a1")
+    if site == "premise_lexical_final":
+        return last_lexical_token_in_named_span(tokenizer, text, row, prefix, "a1")
     if site == "matched_assumption_final":
         matched_idx = int(row["matched_idx"])
         return last_token_in_named_span(tokenizer, text, row, prefix, f"a{matched_idx + 1}")

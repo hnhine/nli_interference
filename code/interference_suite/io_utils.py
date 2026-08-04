@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 PREFERRED_COLUMNS = [
+    "rho_variant",
     "rho_regime",
     "rho_direction",
     "rho_identity",
@@ -142,10 +143,15 @@ PREFERRED_COLUMNS = [
 ]
 
 
-def write_rows_csv(rows: list[dict[str, Any]], path: str | Path) -> Path:
+def write_rows_csv(
+    rows: list[dict[str, Any]],
+    path: str | Path,
+    *,
+    schema_rows: list[dict[str, Any]] | None = None,
+) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    columns = ordered_columns(rows)
+    columns = ordered_columns(rows or schema_rows or [])
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
